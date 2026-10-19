@@ -28,6 +28,7 @@ a { color: #0369a1; }
 
 #map { position: fixed; inset: 0; }
 .maplibregl-ctrl-bottom-right { margin-bottom: 8px; }
+.camera-ctrl button { font-size: 15px; line-height: 1; }
 
 .pos { color: var(--pos); }
 .neg { color: var(--neg); }

@@ -1,9 +1,10 @@
-// Player buildings in 3D: procedural low-poly models rendered by Three.js
-// inside a MapLibre custom layer. Walls/windows are vertex-coloured; roofs
-// and trims use the owner colour (yours vs everyone else's).
+// Player buildings in 3D, rendered by Three.js inside a MapLibre custom
+// layer together with the real city. They're modelled exactly like the real
+// buildings around them (city3d.ts): real-world sizes, the same roofs and
+// shading, one colour per owner, drawn double-sided.
 import * as THREE from 'three';
-import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { MercatorCoordinate, type CustomLayerInterface, type CustomRenderMethodInput, type Map as MlMap } from 'maplibre-gl';
+import { buildingGeometry, CITY_TINTS, type Footprint, type Kind } from './city3d';
 import { alongLines, lineLengthM, mergeLines, offset, type LonLat } from './osm';
 
 export const COLORS = {
@@ -21,237 +22,94 @@ export interface BuildingSpec {
   key: string;          // improvement id
   parcelId: number;
   typeId: string;
-  lonLat: LonLat;
-  bearing: number;      // street direction at this point
-  side: 1 | -1;         // which side of the street
-  width: number;        // metres along the street
+  lonLat: LonLat;       // middle of the building
+  /** Direction its sides run in: the street's bearing, turned round on the far side. */
+  bearing: number;
   mine: boolean;
+  /** Stood on a spot chosen clear of the real buildings (older ones sit on their plot). */
+  placed: boolean;
+  seed: number;
 }
 
-// ------------------------------------------------------------ geometry kit
-
-type Geo = THREE.BufferGeometry;
-const C = (hex: string) => new THREE.Color(hex);
-const PALETTE = {
-  cream: C('#f4ecdc'), brick: C('#d7a283'), stone: C('#e8e2d6'), glass: C('#9fbdd6'),
-  darkGlass: C('#6f8fae'), window: C('#8aa3ba'), door: C('#6b4f3a'), concrete: C('#cfd4da'),
-  steel: C('#9aa5b1'), white: C('#ffffff'),
+/** Real-world sizes: w along the street, d deep, h to the eaves or roof. */
+export const SIZES: Record<string, { w: number; d: number; h: number; kind: Kind }> = {
+  cottage:    { w: 7,   d: 7.5, h: 4.8, kind: 'house' },
+  house:      { w: 8.5, d: 9,   h: 6.2, kind: 'house' },
+  terrace:    { w: 19,  d: 8.5, h: 7,   kind: 'terrace' },
+  shops:      { w: 22,  d: 13,  h: 7.5, kind: 'lowrise' },
+  apartments: { w: 22,  d: 15,  h: 21,  kind: 'midrise' },
+  office:     { w: 28,  d: 22,  h: 48,  kind: 'tower' },
+  tower:      { w: 28,  d: 26,  h: 110, kind: 'tower' },
+  skyscraper: { w: 36,  d: 32,  h: 240, kind: 'skyscraper' },
 };
+export const sizeOf = (typeId: string) => SIZES[typeId] ?? SIZES.house;
 
-function colorize(g: Geo, color: THREE.Color): Geo {
-  const g2 = g.index ? g.toNonIndexed() : g;
-  const n = g2.getAttribute('position').count;
-  const arr = new Float32Array(n * 3);
-  for (let i = 0; i < n; i++) arr.set([color.r, color.g, color.b], i * 3);
-  g2.setAttribute('color', new THREE.BufferAttribute(arr, 3));
-  g2.deleteAttribute('uv');
-  return g2;
-}
+// ------------------------------------------------------------- the models
 
-/** Box with its base at y0 (x along street, z depth, y up). */
-function box(w: number, h: number, d: number, x: number, y0: number, z: number, color = PALETTE.cream): Geo {
-  const g = new THREE.BoxGeometry(w, h, d);
-  g.translate(x, y0 + h / 2, z);
-  return colorize(g, color);
-}
+interface Model { geometry: THREE.BufferGeometry; height: number }
 
-/** Gabled roof running along x. */
-function gable(w: number, h: number, d: number, x: number, y0: number, z: number, color = PALETTE.white): Geo {
-  const hw = w / 2, hd = d / 2;
-  const p = [
-    // two sloped faces
-    -hw, 0, -hd, hw, 0, -hd, hw, h, 0, -hw, 0, -hd, hw, h, 0, -hw, h, 0,
-    -hw, 0, hd, -hw, h, 0, hw, h, 0, -hw, 0, hd, hw, h, 0, hw, 0, hd,
-    // gable ends
-    -hw, 0, -hd, -hw, h, 0, -hw, 0, hd,
-    hw, 0, -hd, hw, 0, hd, hw, h, 0,
-  ];
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.Float32BufferAttribute(p, 3));
-  g.computeVertexNormals();
-  g.translate(x, y0, z);
-  return colorize(g, color);
-}
-
-/** Stack of floors with inset window bands. */
-function floors(n: number, fh: number, w: number, d: number, y0: number, wall: THREE.Color, win: THREE.Color, x = 0, z = 0): Geo[] {
-  const parts: Geo[] = [];
-  for (let i = 0; i < n; i++) {
-    const y = y0 + i * fh;
-    parts.push(box(w, fh * 0.55, d, x, y, z, wall));
-    parts.push(box(w - 0.6, fh * 0.45, d - 0.6, x, y + fh * 0.55, z, win));
-  }
-  return parts;
-}
-
-interface Model { body: Geo; accent: Geo; height: number }
-
-function merge(parts: Geo[]): Geo {
-  return mergeGeometries(parts.filter(Boolean), false)!;
-}
-
-// The front of every model faces -z (towards the street).
-function buildModel(type: string, slotWidth: number): Model {
-  const W = (max: number, min = 8) => Math.max(min, Math.min(max, slotWidth * 0.85));
-  const body: Geo[] = [];
-  const accent: Geo[] = [];
-  let height = 10;
-  switch (type) {
-    case 'cottage': {
-      const w = W(13), d = 10;
-      body.push(box(w, 5, d, 0, 0, 0, PALETTE.cream));
-      body.push(box(2, 3, 0.4, 0, 0, -d / 2 - 0.1, PALETTE.door));
-      body.push(box(2.2, 1.8, 0.3, -w / 4, 1.8, -d / 2 - 0.1, PALETTE.window), box(2.2, 1.8, 0.3, w / 4, 1.8, -d / 2 - 0.1, PALETTE.window));
-      accent.push(gable(w + 1, 4.5, d + 1.2, 0, 5, 0));
-      body.push(box(1.2, 3, 1.2, w / 3, 6.5, 2, PALETTE.brick));
-      height = 9.5;
-      break;
-    }
-    case 'house': {
-      const w = W(15), d = 12;
-      body.push(box(w, 4, d, 0, 0, 0, PALETTE.brick), box(w, 4, d, 0, 4, 0, PALETTE.brick));
-      body.push(box(2.2, 3.2, 0.4, 0, 0, -d / 2 - 0.1, PALETTE.door));
-      for (const fx of [-w / 3.2, w / 3.2]) {
-        body.push(box(2.4, 2, 0.3, fx, 1.2, -d / 2 - 0.1, PALETTE.window));
-        body.push(box(2.4, 2, 0.3, fx, 5.2, -d / 2 - 0.1, PALETTE.window));
-      }
-      body.push(box(2.4, 2, 0.3, 0, 5.2, -d / 2 - 0.1, PALETTE.window));
-      accent.push(gable(w + 1.2, 5, d + 1.4, 0, 8, 0));
-      height = 13;
-      break;
-    }
-    case 'terrace': {
-      const w = W(40, 16), d = 12, n = 3, uw = w / n;
-      for (let i = 0; i < n; i++) {
-        const x = -w / 2 + uw * (i + 0.5);
-        const wall = i % 2 ? PALETTE.cream : PALETTE.brick;
-        body.push(...floors(2, 4.5, uw - 0.2, d, 0, wall, PALETTE.window, x));
-        body.push(box(1.8, 3, 0.4, x, 0, -d / 2 - 0.1, PALETTE.door));
-        accent.push(gable(uw + 0.2, 4.5, d + 1.2, x, 9, 0));
-      }
-      height = 13.5;
-      break;
-    }
-    case 'shops': {
-      const w = W(36, 16), d = 14;
-      body.push(box(w, 4.5, d, 0, 0, 0, PALETTE.stone));
-      body.push(box(w - 1, 3.2, 0.3, 0, 0.3, -d / 2 - 0.1, PALETTE.glass));
-      body.push(...floors(1, 4.5, w, d, 4.5, PALETTE.stone, PALETTE.window));
-      accent.push(box(w, 0.5, 2.6, 0, 3.8, -d / 2 - 1.2));            // awning
-      accent.push(box(w + 0.6, 0.8, d + 0.6, 0, 9, 0));              // roof trim
-      height = 10;
-      break;
-    }
-    case 'apartments': {
-      const w = W(34, 16), d = 18;
-      body.push(box(w, 3.5, d, 0, 0, 0, PALETTE.concrete));
-      body.push(...floors(6, 4, w, d, 3.5, PALETTE.cream, PALETTE.window));
-      accent.push(box(w + 0.8, 1, d + 0.8, 0, 27.5, 0));
-      accent.push(box(w / 3, 3, d / 3, w / 5, 28.5, 0));
-      height = 31.5;
-      break;
-    }
-    case 'office': {
-      const w = W(36, 18), d = 24;
-      body.push(box(w, 5, d, 0, 0, 0, PALETTE.steel));
-      body.push(...floors(10, 4, w, d, 5, PALETTE.steel, PALETTE.glass));
-      body.push(...floors(3, 4, w * 0.7, d * 0.7, 45, PALETTE.steel, PALETTE.glass));
-      accent.push(box(w * 0.7 + 0.8, 1.2, d * 0.7 + 0.8, 0, 57, 0));
-      height = 58;
-      break;
-    }
-    case 'tower': {
-      const w = W(34, 22), d = 30;
-      body.push(box(w, 6, d, 0, 0, 0, PALETTE.steel));
-      body.push(...floors(14, 4, w * 0.85, d * 0.85, 6, PALETTE.white, PALETTE.darkGlass));
-      body.push(...floors(7, 4, w * 0.65, d * 0.65, 62, PALETTE.white, PALETTE.darkGlass));
-      body.push(...floors(4, 4, w * 0.45, d * 0.45, 90, PALETTE.white, PALETTE.darkGlass));
-      accent.push(box(w * 0.45 + 1, 2, d * 0.45 + 1, 0, 106, 0));
-      accent.push(box(0.8, 22, 0.8, 0, 108, 0));
-      height = 130;
-      break;
-    }
-    case 'skyscraper':
-    default: {
-      const w = W(46, 26), d = 40;
-      body.push(box(w, 8, d, 0, 0, 0, PALETTE.steel));
-      body.push(...floors(18, 4.5, w * 0.8, d * 0.8, 8, PALETTE.steel, PALETTE.glass));
-      body.push(...floors(14, 4.5, w * 0.62, d * 0.62, 89, PALETTE.steel, PALETTE.glass));
-      body.push(...floors(10, 4.5, w * 0.45, d * 0.45, 152, PALETTE.steel, PALETTE.glass));
-      body.push(...floors(6, 4.5, w * 0.3, d * 0.3, 197, PALETTE.steel, PALETTE.glass));
-      accent.push(box(w * 0.3 + 1, 3, d * 0.3 + 1, 0, 224, 0));
-      accent.push(box(1.4, 45, 1.4, 0, 227, 0));
-      height = 272;
-      break;
-    }
-  }
-  return { body: merge(body), accent: merge(accent), height };
-}
-
+// Shapes vary a little (roof style, chimney) like the real houses do: six variants per type.
 const modelCache = new Map<string, Model>();
-function model(type: string, slotWidth: number): Model {
-  const bucket = Math.round(slotWidth / 4) * 4;
-  const k = `${type}:${bucket}`;
+function model(typeId: string, seed: number): Model {
+  const k = `${typeId}:${seed % 6}`;
   let m = modelCache.get(k);
   if (!m) {
-    m = buildModel(type, bucket);
+    const s = sizeOf(typeId), hw = s.w / 2, hd = s.d / 2;
+    const fp: Footprint = { outer: [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]], holes: [], height: s.h, minHeight: 0, seed: seed % 6, kind: s.kind };
+    // White vertex colours carry the shading; the material supplies the owner's colour.
+    const geometry = buildingGeometry(fp);
+    geometry.computeBoundingBox();
+    m = { geometry, height: geometry.boundingBox!.max.y };
     modelCache.set(k, m);
   }
   return m;
 }
 
-/** Footprint width limits [max, min] in metres, matching buildModel. */
-const WIDTH: Record<string, [number, number]> = {
-  cottage: [13, 8], house: [15, 8], terrace: [40, 16], shops: [36, 16], apartments: [34, 16],
-  office: [36, 18], tower: [34, 22], skyscraper: [46, 26],
-};
-
-/** Ground rectangle a player building covers, as a GeoJSON ring (with a margin). */
-export function footprint(spec: BuildingSpec, margin = 3): LonLat[] {
-  const [max, min] = WIDTH[spec.typeId] ?? [20, 8];
-  const bucket = Math.round(spec.width / 4) * 4;
-  const halfW = Math.max(min, Math.min(max, bucket * 0.85)) / 2 + margin;
-  const halfD = (DEPTH[spec.typeId] ?? 14) / 2 + margin;
+/** Ground rectangle a player building covers, as a closed GeoJSON ring (with a margin). */
+export function footprint(spec: Pick<BuildingSpec, 'typeId' | 'lonLat' | 'bearing'>, margin = 3): LonLat[] {
+  const s = sizeOf(spec.typeId);
+  const halfW = s.w / 2 + margin, halfD = s.d / 2 + margin;
   const along = spec.bearing, across = spec.bearing + 90;
   const c = (a: number, b: number) => offset(offset(spec.lonLat, along, a), across, b);
   const ring = [c(-halfW, -halfD), c(halfW, -halfD), c(halfW, halfD), c(-halfW, halfD)];
   return [...ring, ring[0]];
 }
 
-/** Depth of a building's footprint (for setting it back from the street). */
-const DEPTH: Record<string, number> = {
-  cottage: 10, house: 12, terrace: 12, shops: 14, apartments: 18, office: 24, tower: 30, skyscraper: 40,
-};
+const seedOf = (id: number) => Math.abs(Math.imul(id, 2654435761) | 0);
 
 // ------------------------------------------------------ placement on streets
 
+/** Where along the street (metres) the middle of a run of plots is. */
+export function plotCentre(parcel: { geom: LonLat[][]; slots_total: number }, slot: number, slotsUsed: number) {
+  const lines = mergeLines(parcel.geom);
+  const total = lines.reduce((s, l) => s + lineLengthM(l), 0);
+  return { lines, total, d: ((slot + slotsUsed / 2) * total) / parcel.slots_total };
+}
+
 /**
- * Where each improvement on a parcel goes: slots are spread evenly along
- * the street; buildings alternate sides of the road.
+ * Where each player building on a parcel stands: the spot it was built on,
+ * or for older buildings, their plot, alternating sides of the road.
+ * Real buildings bought off the map are drawn by the city, not here.
  */
 export function placeImprovements(parcel: {
   id: number; geom: LonLat[][]; slots_total: number; owner_id: string | null;
-  improvements: { id: number; type_id: string; slot_index: number; slots_used: number }[];
+  improvements: { id: number; type_id: string; slot_index: number; slots_used: number; lon?: number | null; lat?: number | null; bearing?: number | null }[];
 }, myPlayerId: string | null): BuildingSpec[] {
   if (!parcel.improvements?.length) return [];
-  const lines = mergeLines(parcel.geom);
-  const total = lines.reduce((s, l) => s + lineLengthM(l), 0);
-  const slotLen = total / parcel.slots_total;
-  return parcel.improvements.map((imp) => {
-    const centre = (imp.slot_index + imp.slots_used / 2) * slotLen;
-    const at = alongLines(lines, centre);
-    const side: 1 | -1 = imp.slot_index % 2 === 0 ? 1 : -1;
-    const depth = DEPTH[imp.type_id] ?? 14;
-    const setback = 9 + depth / 2;
+  const mine = !!myPlayerId && parcel.owner_id === myPlayerId;
+  return parcel.improvements.filter((imp) => imp.type_id !== 'real').map((imp) => {
+    const base = { key: String(imp.id), parcelId: parcel.id, typeId: imp.type_id, mine, seed: seedOf(imp.id) };
+    if (imp.lon != null && imp.lat != null && imp.bearing != null) {
+      return { ...base, lonLat: [imp.lon, imp.lat] as LonLat, bearing: imp.bearing, placed: true };
+    }
+    const { lines, d } = plotCentre(parcel, imp.slot_index, imp.slots_used);
+    const at = alongLines(lines, d);
+    const side = imp.slot_index % 2 === 0 ? 1 : -1;
     return {
-      key: String(imp.id),
-      parcelId: parcel.id,
-      typeId: imp.type_id,
-      lonLat: offset(at.p, at.bearing + 90 * side, setback),
-      bearing: at.bearing,
-      side,
-      width: imp.slots_used * slotLen,
-      mine: !!myPlayerId && parcel.owner_id === myPlayerId,
+      ...base,
+      lonLat: offset(at.p, at.bearing + 90 * side, 8 + sizeOf(imp.type_id).d / 2),
+      bearing: at.bearing + (side === -1 ? 180 : 0),
+      placed: false,
     };
   });
 }
@@ -260,7 +118,7 @@ export function placeImprovements(parcel: {
 
 interface Live {
   spec: BuildingSpec;
-  group: THREE.Group;
+  mesh: THREE.Mesh;
   born: number;
   height: number;
 }
@@ -277,15 +135,20 @@ export class BuildingLayer implements CustomLayerInterface {
   private origin: LonLat = [0, 0];
   private originMerc = MercatorCoordinate.fromLngLat([0, 0], 0);
   private live = new Map<string, Live>();
-  private bodyMat = new THREE.MeshLambertMaterial({ vertexColors: true });
   private cityMat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
   private city = new Map<string, { mesh: THREE.Mesh; anchor: LonLat }>();
   private cityGroup = new THREE.Group();
-  private accentMats = {
-    mine: new THREE.MeshLambertMaterial({ color: COLORS.mine }),
-    other: new THREE.MeshLambertMaterial({ color: COLORS.other }),
+  private playerMats = {
+    mine: new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide, color: CITY_TINTS.mine }),
+    other: new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide, color: CITY_TINTS.other }),
   };
-  private highlightMat = new THREE.MeshLambertMaterial({ color: COLORS.selected, emissive: '#7c4a00' });
+  private selectedMat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide, color: COLORS.selected, emissive: '#5a3500' });
+  // Drawn over a real building's own model, so it wins the depth test.
+  private highlightMat = new THREE.MeshLambertMaterial({
+    vertexColors: true, side: THREE.DoubleSide, color: COLORS.selected, emissive: '#5a3500',
+    polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4,
+  });
+  private highlight: { mesh: THREE.Mesh; anchor: LonLat } | null = null;
   private selectedParcel: number | null = null;
   private animating = false;
 
@@ -312,8 +175,9 @@ export class BuildingLayer implements CustomLayerInterface {
   private resetOrigin(p: LonLat) {
     this.origin = p;
     this.originMerc = MercatorCoordinate.fromLngLat(p, 0);
-    for (const l of this.live.values()) l.group.position.copy(this.toScene(l.spec.lonLat));
+    for (const l of this.live.values()) l.mesh.position.copy(this.toScene(l.spec.lonLat));
     for (const c of this.city.values()) c.mesh.position.copy(this.toScene(c.anchor));
+    if (this.highlight) this.highlight.mesh.position.copy(this.toScene(this.highlight.anchor));
   }
 
   private ensureOrigin() {
@@ -346,24 +210,56 @@ export class BuildingLayer implements CustomLayerInterface {
     if (geometry) {
       const mesh = new THREE.Mesh(geometry, this.cityMat);
       mesh.position.copy(this.toScene(anchor));
-      mesh.matrixAutoUpdate = true;
+      mesh.userData.tile = key;
       this.city.set(key, { mesh, anchor });
       this.cityGroup.add(mesh);
     }
     this.map.triggerRepaint();
   }
 
-  setSelected(parcelId: number | null) {
-    this.selectedParcel = parcelId;
-    for (const l of this.live.values()) this.applyAccent(l);
+  /** Outline one real building in the selection colour (null clears it). */
+  setHighlight(anchor: LonLat | null, geometry: THREE.BufferGeometry | null) {
+    if (this.highlight) {
+      this.scene.remove(this.highlight.mesh);
+      this.highlight.mesh.geometry.dispose();
+      this.highlight = null;
+    }
+    if (anchor && geometry && this.map) {
+      this.ensureOrigin();
+      const mesh = new THREE.Mesh(geometry, this.highlightMat);
+      mesh.position.copy(this.toScene(anchor));
+      this.highlight = { mesh, anchor };
+      this.scene.add(mesh);
+    }
     this.map?.triggerRepaint();
   }
 
-  private applyAccent(l: Live) {
-    const accent = l.group.children[1] as THREE.Mesh;
-    accent.material = l.spec.parcelId === this.selectedParcel
-      ? this.highlightMat
-      : l.spec.mine ? this.accentMats.mine : this.accentMats.other;
+  /** The real-city triangle under a screen point: which tile, and which triangle. */
+  pickCity(x: number, y: number): { tile: string; face: number } | null {
+    if (!this.map || !this.cityGroup.visible || !this.city.size) return null;
+    const canvas = this.map.getCanvas();
+    const ndc = new THREE.Vector2((x / canvas.clientWidth) * 2 - 1, 1 - (y / canvas.clientHeight) * 2);
+    const inv = this.camera.projectionMatrix.clone().invert();
+    const a = new THREE.Vector3(ndc.x, ndc.y, -1).applyMatrix4(inv);
+    const b = new THREE.Vector3(ndc.x, ndc.y, 0.5).applyMatrix4(inv);
+    if (![a.x, a.y, a.z, b.x, b.y, b.z].every(Number.isFinite)) return null;
+    this.scene.updateMatrixWorld();
+    const ray = new THREE.Raycaster(a, b.sub(a).normalize());
+    const hit = ray.intersectObjects(this.cityGroup.children, false)[0];
+    if (!hit || hit.faceIndex == null) return null;
+    return { tile: hit.object.userData.tile as string, face: hit.faceIndex };
+  }
+
+  setSelected(parcelId: number | null) {
+    this.selectedParcel = parcelId;
+    for (const l of this.live.values()) this.applyMaterial(l);
+    this.map?.triggerRepaint();
+  }
+
+  private applyMaterial(l: Live) {
+    l.mesh.material = l.spec.parcelId === this.selectedParcel
+      ? this.selectedMat
+      : l.spec.mine ? this.playerMats.mine : this.playerMats.other;
   }
 
   /** Replace the set of visible buildings; new ones grow out of the ground. */
@@ -375,23 +271,21 @@ export class BuildingLayer implements CustomLayerInterface {
     for (const spec of specs) {
       seen.add(spec.key);
       const old = this.live.get(spec.key);
-      if (old && old.spec.mine === spec.mine && old.spec.typeId === spec.typeId &&
+      if (old && old.spec.mine === spec.mine && old.spec.typeId === spec.typeId && old.spec.bearing === spec.bearing &&
           old.spec.lonLat[0] === spec.lonLat[0] && old.spec.lonLat[1] === spec.lonLat[1]) continue;
-      if (old) this.scene.remove(old.group);
-      const m = model(spec.typeId, spec.width);
-      const group = new THREE.Group();
-      group.add(new THREE.Mesh(m.body, this.bodyMat));
-      group.add(new THREE.Mesh(m.accent, this.accentMats.mine));
-      group.position.copy(this.toScene(spec.lonLat));
-      group.rotation.y = ((90 - spec.bearing) * Math.PI) / 180 + (spec.side === -1 ? Math.PI : 0);
-      const l: Live = { spec, group, born: animateNew && !old ? now : 0, height: m.height };
-      this.applyAccent(l);
+      if (old) this.scene.remove(old.mesh);
+      const m = model(spec.typeId, spec.seed);
+      const mesh = new THREE.Mesh(m.geometry, this.playerMats.mine);
+      mesh.position.copy(this.toScene(spec.lonLat));
+      mesh.rotation.y = ((90 - spec.bearing) * Math.PI) / 180;
+      const l: Live = { spec, mesh, born: animateNew && !old ? now : 0, height: m.height };
+      this.applyMaterial(l);
       this.live.set(spec.key, l);
-      this.scene.add(group);
+      this.scene.add(mesh);
     }
     for (const [k, l] of this.live) {
       if (!seen.has(k)) {
-        this.scene.remove(l.group);
+        this.scene.remove(l.mesh);
         this.live.delete(k);
       }
     }
@@ -406,7 +300,8 @@ export class BuildingLayer implements CustomLayerInterface {
     const metresPerPx = 40075016 * Math.cos((this.map.getCenter().lat * Math.PI) / 180) / (512 * 2 ** this.map.getZoom());
     for (const l of this.live.values()) {
       const base = this.map.project(l.spec.lonLat as [number, number]);
-      const radius = Math.max(14, 12 / metresPerPx);
+      const s = sizeOf(l.spec.typeId);
+      const radius = Math.max(14, Math.min(s.w, s.d) / 2 / metresPerPx);
       // Tall buildings: also accept clicks up the facade.
       const up = Math.min(l.height / metresPerPx, 400) * Math.sin((this.map.getPitch() * Math.PI) / 180);
       const dx = x - base.x;
@@ -423,6 +318,7 @@ export class BuildingLayer implements CustomLayerInterface {
   render(_gl: WebGLRenderingContext | WebGL2RenderingContext, args: CustomRenderMethodInput) {
     const zoom = this.map.getZoom();
     this.cityGroup.visible = zoom >= CITY_MIN_ZOOM;
+    if (this.highlight) this.highlight.mesh.visible = this.cityGroup.visible;
     if ((!this.live.size && !(this.city.size && this.cityGroup.visible)) || zoom < MIN_3D_ZOOM) return;
     const now = performance.now();
     let anim = false;
@@ -431,7 +327,7 @@ export class BuildingLayer implements CustomLayerInterface {
       const t = Math.min(1, (now - l.born) / 900);
       const c1 = 1.70158, c3 = c1 + 1;
       const e = 1 + c3 * Math.pow(t - 1, 3) + c1 * Math.pow(t - 1, 2);   // easeOutBack
-      l.group.scale.set(1, Math.max(0.001, e), 1);
+      l.mesh.scale.set(1, Math.max(0.001, e), 1);
       if (t >= 1) l.born = 0; else anim = true;
     }
     const s = this.originMerc.meterInMercatorCoordinateUnits();

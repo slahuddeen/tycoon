@@ -1,8 +1,8 @@
 // HTML renderers. Pure functions from game data to markup; main.ts wires
 // up behaviour through data-action attributes.
 import {
-  ago, BUILDING_ICON, BuildingType, CLASS_LABEL, countdown, esc, Me, metres, money, Parcel, pct,
-  reasonLabel, World,
+  ago, BUILDING_ICON, BuildingQuote, BuildingType, CLASS_LABEL, countdown, esc, Improvement, KIND_ICON, KIND_LABEL, Me, metres, money,
+  Parcel, pct, reasonLabel, World,
 } from './format';
 
 export const $ = <T extends HTMLElement = HTMLElement>(sel: string) => document.querySelector(sel) as T;
@@ -117,7 +117,7 @@ export function panelLoading(text: string) {
 function plotStrip(p: Parcel, mine: boolean, picked: number | null) {
   const cells: string[] = [];
   const occ = new Map<number, { type: string; len: number }>();
-  for (const i of p.improvements) occ.set(i.slot_index, { type: i.type_id, len: i.slots_used });
+  for (const i of p.improvements) if (i.slots_used > 0) occ.set(i.slot_index, { type: i.type_id, len: i.slots_used });
   for (let s = 0; s < p.slots_total;) {
     const o = occ.get(s);
     if (o) {
@@ -189,13 +189,16 @@ export function parcelPanel(p: Parcel, me: Me, types: BuildingType[], ruleset: a
       </div>
     </section>` : '';
 
+  const label = (i: Improvement) => i.type_id === 'real'
+    ? `Real building <small>${i.floor_area_m2 ? `${Math.round(i.floor_area_m2).toLocaleString('en-GB')} m² of floors` : ''}</small>`
+    : `${esc(types.find((t) => t.id === i.type_id)?.name ?? i.type_id)}
+       <small>plot ${i.slot_index + 1}${i.slots_used > 1 ? `–${i.slot_index + i.slots_used}` : ''}</small>`;
   const buildings = p.improvements.length ? `
     <section>
       <h3>Buildings <small>${p.improvements.length}</small></h3>
       <ul class="blist">
-        ${p.improvements.map((i) => `<li><span>${BUILDING_ICON[i.type_id] ?? '🏗️'} ${esc(types.find((t) => t.id === i.type_id)?.name ?? i.type_id)}
-          <small>plot ${i.slot_index + 1}${i.slots_used > 1 ? `–${i.slot_index + i.slots_used}` : ''}</small></span>
-          <span>${money(i.cost, { compact: true })}${mine ? ` <button class="mini danger" data-action="demolish" data-imp="${i.id}" title="Demolish (no refund)">✕</button>` : ''}</span></li>`).join('')}
+        ${p.improvements.map((i) => `<li><span>${BUILDING_ICON[i.type_id] ?? '🏗️'} ${label(i)}</span>
+          <span>${money(i.cost, { compact: true })}${mine && i.type_id !== 'real' ? ` <button class="mini danger" data-action="demolish" data-imp="${i.id}" title="Demolish (no refund)">✕</button>` : ''}</span></li>`).join('')}
       </ul>
     </section>` : '';
 
@@ -213,6 +216,7 @@ export function parcelPanel(p: Parcel, me: Me, types: BuildingType[], ruleset: a
         <div><small>Buildings</small><b>${money(p.improvement_value)}</b></div>
       </div>
       ${plotStrip(p, mine, picked)}
+      ${mine ? `<p class="plot-hint">New buildings go on open ground beside the street. To own the real buildings here, click one on the map.</p>` : ''}
     </section>
     ${buy}
     ${build}
@@ -220,6 +224,51 @@ export function parcelPanel(p: Parcel, me: Me, types: BuildingType[], ruleset: a
     ${perTick}
     ${mine ? `<section class="danger-zone"><button class="link danger" data-action="release" data-id="${p.id}">Give this street back to the bank (no refund)</button></section>` : ''}
   `;
+}
+
+/** Side panel for a real building picked on the map. */
+export function buildingPanel(kind: string, p: Parcel, q: BuildingQuote, me: Me) {
+  const mine = p.owner_id === me.player.id;
+  const ownerLine = q.owner_id
+    ? `<div class="owner ${q.owner_id === me.player.id ? 'mine' : 'other'}"><span class="dot"></span>${q.owner_id === me.player.id ? 'You own this building' : `Owned by <b>${esc(q.owner_handle)}</b>`}</div>`
+    : `<div class="owner none">For sale by the bank</div>`;
+  let action = '';
+  if (!q.owner_id) {
+    if (mine) {
+      action = `<section class="buy">
+        <button class="primary big" data-action="buy-building">Buy this building for ${money(q.value)}</button>
+        ${me.balance < q.value ? `<p class="hint">You have ${money(me.balance)}: not enough yet.</p>` : ''}
+      </section>`;
+    } else if (!p.owner_id) {
+      action = `<section class="buy">
+        <p class="hint">Real buildings are bought along with the street they stand on. Buy <b>${esc(p.name)}</b> first, then this building.</p>
+        <button class="primary big" data-action="buy-street-here" data-id="${p.id}">Buy ${esc(p.name)} for ${money(p.purchase?.total ?? p.price)}</button>
+      </section>`;
+    } else {
+      action = `<section><p class="hint">This is on <b>${esc(p.owner_handle)}</b>'s street, so only they can buy it.</p></section>`;
+    }
+  }
+  return `
+    <button class="close" data-action="close-panel" aria-label="Close">×</button>
+    <header>
+      <h2>${KIND_ICON[kind] ?? BUILDING_ICON.real} ${esc(KIND_LABEL[kind] ?? 'Building')}</h2>
+      <p class="sub">on ${esc(p.name)}${p.suburb ? `, ${esc(p.suburb)}` : ''}</p>
+      <div class="chips"><span>${q.floors} floor${q.floors === 1 ? '' : 's'}</span><span>${Math.round(q.area_m2).toLocaleString('en-GB')} m² footprint</span><span>${Math.round(q.height_m)} m tall</span></div>
+    </header>
+    ${ownerLine}
+    <section>
+      <div class="values">
+        <div><small>Value</small><b>${money(q.value)}</b></div>
+        <div><small>Income / tick</small><b class="pos">${money(q.income_per_tick, { sign: true })}</b></div>
+      </div>
+    </section>
+    ${action}
+    <section>
+      <p class="fine">Valued on its ${Math.round(q.floor_area_m2).toLocaleString('en-GB')} m² of floor space and how busy the area is.
+      Once bought it earns building income every tick and counts towards the street's building value (and any tax on it).
+      Real buildings can't be moved or demolished.</p>
+      <button class="link" data-action="goto-parcel" data-id="${p.id}">See ${esc(p.name)} →</button>
+    </section>`;
 }
 
 export function modal(title: string, body: string) {
@@ -288,16 +337,18 @@ export const HELP = `
   <ol class="help">
     <li><b>Find a street.</b> Search for any place on Earth, or zoom in on the map and click a named road.</li>
     <li><b>Buy it.</b> Price depends on length, road type and how busy the neighbourhood is.</li>
-    <li><b>Build.</b> Each street has plots along its length. Put houses, shops and towers on them; they appear in 3D.</li>
+    <li><b>Build.</b> Each street has plots along its length. Put houses, shops and towers on them; they go up in 3D on open ground beside the street. Real buildings are never knocked down.</li>
+    <li><b>Buy real buildings.</b> Click any building on the map. Once you own its street, you can buy it as it stands.</li>
     <li><b>Collect.</b> Every tick you earn income from your land and buildings and pay tax, all shown separately in the bar at the top and in your ledger.</li>
     <li><b>Climb the leaderboard</b> by net worth. You started with a loan, so you begin at zero.</li>
+    <li><b>Camera.</b> Drag with the right mouse button (or Ctrl+drag, or two fingers) to orbit and tilt. 🚶 drops you to street level.</li>
   </ol>
   <p class="fine">Each world has its own economic rules: try the same strategy in <i>Classic</i> and <i>Land Tax</i> and compare.
   Streets are real OpenStreetMap roads. Motorways, service roads and footpaths can't be bought.</p>
   <p class="fine">Map © OpenStreetMap contributors · tiles by OpenFreeMap · geocoding by Nominatim.</p>`;
 
 export function feed(events: any[]) {
-  const verb: Record<string, string> = { purchase: 'bought', build: 'built on', demolish: 'demolished on', release: 'gave up', joined: 'joined the game', lease_expired: 'lost the lease on' };
+  const verb: Record<string, string> = { purchase: 'bought', buy_building: 'bought a building on', build: 'built on', demolish: 'demolished on', release: 'gave up', joined: 'joined the game', lease_expired: 'lost the lease on' };
   return events.slice(0, 8).map((e) => `<li ${e.parcel_id ? `data-action="goto-parcel" data-id="${e.parcel_id}"` : ''}>
     <b>${esc(e.handle ?? 'someone')}</b> ${verb[e.kind] ?? e.kind}
     ${e.parcel_name ? `<span class="st">${e.kind === 'build' && e.data?.type_id ? `${BUILDING_ICON[e.data.type_id] ?? ''} ` : ''}${esc(e.parcel_name)}</span>` : ''}

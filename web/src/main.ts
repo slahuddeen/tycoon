@@ -1,8 +1,10 @@
 import './style.css';
 import { Backend, makeBackend, saveServerOverride, serverConfig } from './backend';
-import { BuildingType, errorText, Me, money, Parcel, reasonLabel, setCurrency, World, countdown } from './format';
-import { GameMap, PARCEL_MIN_ZOOM } from './map';
+import { CITY_MIN_ZOOM, plotCentre } from './buildings3d';
+import { BuildingQuote, BuildingType, errorText, Me, money, Parcel, reasonLabel, setCurrency, World, countdown } from './format';
+import { GameMap, PARCEL_MIN_ZOOM, type RealBuilding } from './map';
 import * as osm from './osm';
+import { chooseSlot, findSpot } from './placement';
 import * as ui from './ui';
 import { $ } from './ui';
 
@@ -29,6 +31,8 @@ const state = {
   types: [] as BuildingType[],
   ruleset: null as any,
   panel: null as Parcel | null,
+  /** The real building whose panel is open. */
+  building: null as { b: RealBuilding; parcel: Parcel; quote: BuildingQuote } | null,
   pickedPlot: null as number | null,
   lookup: 0,
   searchGame: [] as any[],
@@ -222,6 +226,7 @@ async function refreshMe() {
     if (before != null && state.me!.world.tick_count !== before) {
       refreshView();
       if (state.panel) openParcel(state.panel.id, false);
+      else if (state.building) openBuilding(state.building.b, state.building.parcel.id);
     }
   } catch { /* transient */ }
 }
@@ -277,6 +282,8 @@ function openPanelHtml(html: string) {
 
 function closePanel() {
   state.panel = null;
+  state.building = null;
+  gm.highlightBuilding(null);
   state.lookup++;
   $('#panel').hidden = true;
   document.body.classList.remove('panel-open');
@@ -301,6 +308,7 @@ function showParcel(p: Parcel) {
     state.pickedPlot = null;
   }
   state.panel = p;
+  if (state.building) { state.building = null; gm.highlightBuilding(null); }
   gm.select(p);
   gm.upsertParcel(p);
   const scroll = $('#panel').scrollTop;
@@ -339,6 +347,59 @@ async function pickStreet(at: osm.LonLat, preferName?: string, radiusM?: number)
 }
 
 gm.onParcelClick = (id) => { state.lookup++; gm.setPending(null); openParcel(id); };
+
+// ------------------------------------------------------- real buildings
+
+/** The street a real building is on: the one it was bought with, or the nearest named road. */
+async function streetOfBuilding(b: RealBuilding, seq: number): Promise<Parcel | null> {
+  for (const p of gm.parcels.values()) {
+    if (p.improvements?.some((i) => i.type_id === 'real' && i.lon != null && i.lat != null && osm.distM([i.lon, i.lat], b.centre) < 4)) {
+      return api<Parcel>('tycoon_parcel', { parcel_id: p.id });
+    }
+  }
+  const cand = gm.findStreetAt(b.centre, undefined, 45);
+  if (!cand || seq !== state.lookup) return null;
+  const all = cand.lines.flat();
+  const suburb = await osm.reverseLocality(all[Math.floor(all.length / 2)]);
+  if (seq !== state.lookup) return null;
+  return api<Parcel>('tycoon_claim', { name: cand.name, suburb, highway: cand.highway, lines: cand.lines });
+}
+
+const quoteArgs = (b: RealBuilding) => ({ outline: b.outline, height: b.height });
+
+async function openBuilding(b: RealBuilding, parcelId?: number) {
+  const seq = ++state.lookup;
+  state.panel = null;
+  gm.setPending(null);
+  gm.highlightBuilding(b);
+  if (!state.building) openPanelHtml(ui.panelLoading('Looking up this building…'));
+  try {
+    let parcel = parcelId != null ? await api<Parcel>('tycoon_parcel', { parcel_id: parcelId }) : await streetOfBuilding(b, seq);
+    if (seq !== state.lookup) return;
+    if (!parcel) {
+      closePanel();
+      toast("This building isn't on a street that can be bought.", 'info', 5000);
+      return;
+    }
+    let quote = await api<BuildingQuote>('tycoon_building_quote', { parcel_id: parcel.id, ...quoteArgs(b) });
+    // Already bought along with a different street: show that one.
+    if (quote.owned_parcel_id && quote.owned_parcel_id !== parcel.id) {
+      parcel = await api<Parcel>('tycoon_parcel', { parcel_id: quote.owned_parcel_id });
+      quote = await api<BuildingQuote>('tycoon_building_quote', { parcel_id: parcel.id, ...quoteArgs(b) });
+    }
+    if (seq !== state.lookup) return;
+    state.building = { b, parcel, quote };
+    gm.select(parcel);
+    gm.upsertParcel(parcel);
+    openPanelHtml(ui.buildingPanel(b.kind, parcel, quote, state.me!));
+  } catch (e) {
+    if (seq !== state.lookup) return;
+    closePanel();
+    toast(errorText(e), 'bad', 6000);
+  }
+}
+
+gm.onBuildingClick = (b) => { if (state.world) openBuilding(b); };
 
 gm.onEmptyClick = (at, zoom) => {
   if (!state.world) return;
@@ -396,10 +457,61 @@ const actions: Record<string, (el: HTMLElement, ev: Event) => void> = {
   'close-panel': () => closePanel(),
   'close-modal': () => showModal(null),
   buy: (el) => act('tycoon_buy', { parcel_id: Number(el.dataset.id) }, () => `You bought ${state.panel?.name}! 🎉`),
-  build: (el) => {
+  build: async (el) => {
     const t = state.types.find((x) => x.id === el.dataset.type);
-    act('tycoon_build', { parcel_id: Number(el.dataset.id), type_id: el.dataset.type, slot: state.pickedPlot },
-      () => `${t?.name ?? 'Building'} under construction 🏗️`);
+    const p = state.panel;
+    if (!t || !p || p.id !== Number(el.dataset.id)) return;
+    const slot = chooseSlot(p, t.slots_used, state.pickedPlot);
+    if (slot == null) {
+      // No room on the plots: let the server explain.
+      return act('tycoon_build', { parcel_id: p.id, type_id: t.id, slot: state.pickedPlot }, () => `${t.name} under construction 🏗️`);
+    }
+    // Find open ground beside the street, clear of the real buildings. We
+    // need those loaded, so come in close to the plot first if we're far out.
+    const { lines, d } = plotCentre(p, slot, t.slots_used);
+    const at = osm.alongLines(lines, d).p;
+    const view = gm.visibleBounds();
+    const inView = at[0] > view.west && at[0] < view.east && at[1] > view.south && at[1] < view.north;
+    if (gm.zoom() < CITY_MIN_ZOOM + 0.5 || !inView) {
+      gm.map.easeTo({ center: at, zoom: Math.max(gm.zoom(), 16.5), duration: 900 });
+      await gm.settled();
+    }
+    const spot = findSpot(p, t.id, slot, t.slots_used, gm.obstacles(), gm.visibleBounds());
+    if (!spot) {
+      toast(`No open ground big enough for a ${t.name.toLowerCase()} near that plot. Try a smaller building, another plot, or pan along the street.`, 'info', 6500);
+      return;
+    }
+    act('tycoon_build', { parcel_id: p.id, type_id: t.id, slot, lon: spot.lonLat[0], lat: spot.lonLat[1], bearing: spot.bearing },
+      () => `${t.name} under construction 🏗️`);
+  },
+  'buy-building': async () => {
+    const cur = state.building;
+    if (!cur) return;
+    try {
+      const r = await api<any>('tycoon_buy_building', { parcel_id: cur.parcel.id, ...quoteArgs(cur.b) });
+      gm.upsertParcel(r.parcel);
+      toast(`You bought it! 🎉 It earns ${money(cur.quote.income_per_tick, { sign: true })} a tick.`, 'good');
+      refreshMe();
+      refreshFeed();
+      openBuilding(cur.b, cur.parcel.id);
+    } catch (e) {
+      toast(errorText(e), 'bad');
+    }
+  },
+  'buy-street-here': async (el) => {
+    const cur = state.building;
+    if (!cur) return;
+    try {
+      const r = await api<any>('tycoon_buy', { parcel_id: Number(el.dataset.id) });
+      gm.upsertParcel(r.parcel);
+      toast(`You bought ${r.parcel.name}! Now you can buy the buildings on it.`, 'good');
+      refreshMe();
+      refreshFeed();
+      refreshOwned();
+      openBuilding(cur.b, cur.parcel.id);
+    } catch (e) {
+      toast(errorText(e), 'bad');
+    }
   },
   'pick-plot': (el) => {
     state.pickedPlot = el.dataset.slot === '' ? null : Number(el.dataset.slot);

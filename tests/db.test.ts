@@ -162,6 +162,80 @@ describe('authorisation', () => {
   });
 });
 
+describe('real buildings', () => {
+  // A 10 m x 8 m outline whose centre is `back` metres north of a street running east from lon/lat.
+  const outline = (lon: number, lat: number, back = 12) => {
+    const mLon = 1 / (111320 * Math.cos((lat * Math.PI) / 180)), mLat = 1 / 111320;
+    const x0 = lon + 20 * mLon, y0 = lat + (back - 4) * mLat;
+    return [[x0, y0], [x0 + 10 * mLon, y0], [x0 + 10 * mLon, y0 + 8 * mLat], [x0, y0 + 8 * mLat]];
+  };
+
+  it('are valued from their floor area and can be bought on your own street', async () => {
+    const a = await newPlayer(db, classic, 'homebuyer');
+    const parcel = await claim(db, a, 'Real Rd', fakeStreet(1.1, 51, 200));
+    const house = { outline: outline(1.1, 51), height: 6.4 };
+    // Not yours yet.
+    expect(await apiError(db, 'tycoon_buy_building', { ...a, parcel_id: parcel.id, ...house })).toContain('not_owner');
+    const q = await api(db, 'tycoon_building_quote', { ...a, parcel_id: parcel.id, ...house });
+    expect(q.area_m2).toBeCloseTo(80, 0);
+    expect(q.floors).toBe(2);
+    expect(q.owner_id).toBeNull();
+    expect(q.value / (160 * 3000)).toBeCloseTo(1, 2);   // 160 m² of floors at the ruleset's £30/m², density 1
+
+    const before = (await api(db, 'tycoon_buy', { ...a, parcel_id: parcel.id })).balance;
+    const r = await api(db, 'tycoon_buy_building', { ...a, parcel_id: parcel.id, ...house });
+    expect(r.balance).toBe(before - q.value);
+    const imp = r.parcel.improvements.find((i: any) => i.type_id === 'real');
+    expect(imp.cost).toBe(q.value);
+    expect(imp.slots_used).toBe(0);
+    expect(r.parcel.improvement_value).toBe(q.value);
+    expect(r.parcel.slots_used).toBe(0);
+
+    // It now belongs to someone, and can't be bought twice or demolished.
+    const again = await api(db, 'tycoon_building_quote', { ...a, parcel_id: parcel.id, ...house });
+    expect(again.owner_handle).toBe('homebuyer');
+    expect(await apiError(db, 'tycoon_buy_building', { ...a, parcel_id: parcel.id, ...house })).toContain('building_already_owned');
+    expect(await apiError(db, 'tycoon_demolish', { ...a, improvement_id: imp.id })).toContain('cannot_demolish_real_building');
+  });
+
+  it('must front the street, and must be a real outline', async () => {
+    const a = await newPlayer(db, classic, 'farbuyer');
+    const parcel = await claim(db, a, 'Far Rd', fakeStreet(1.2, 51, 200));
+    await api(db, 'tycoon_buy', { ...a, parcel_id: parcel.id });
+    expect(await apiError(db, 'tycoon_buy_building', { ...a, parcel_id: parcel.id, outline: outline(1.2, 51, 400), height: 6 }))
+      .toContain('building_not_on_street');
+    expect(await apiError(db, 'tycoon_buy_building', { ...a, parcel_id: parcel.id, outline: [[1.2, 51], [1.2, 51.00001]], height: 6 }))
+      .toContain('invalid_building');
+    expect(await apiError(db, 'tycoon_buy_building', { ...a, parcel_id: parcel.id, outline: [[1.2, 51], ['x', 51], [1.2001, 51]], height: 6 }))
+      .toContain('invalid_building');
+  });
+
+  it('are not in the build menu, and count as built for the vacancy penalty', async () => {
+    const types = await api(db, 'tycoon_building_types', {});
+    expect(types.map((t: any) => t.id)).not.toContain('real');
+    const a = await newPlayer(db, landtax, 'lvtbuyer');
+    expect(await apiError(db, 'tycoon_build', { ...a, parcel_id: 0, type_id: 'real' })).toMatch(/parcel_not_found|unknown_building_type/);
+    const parcel = await claim(db, a, 'Vacant Rd', fakeStreet(1.3, 51, 200));
+    await api(db, 'tycoon_buy', { ...a, parcel_id: parcel.id });
+    const empty = await api(db, 'tycoon_parcel', { ...a, parcel_id: parcel.id });
+    expect(empty.per_tick.taxes.some((t: any) => t.id === 'vacancy')).toBe(true);
+    const r = await api(db, 'tycoon_buy_building', { ...a, parcel_id: parcel.id, outline: outline(1.3, 51), height: 9 });
+    expect(r.parcel.per_tick.taxes.some((t: any) => t.id === 'vacancy')).toBe(false);
+  });
+
+  it('player buildings keep the spot they were built on', async () => {
+    const a = await newPlayer(db, classic, 'placer');
+    const parcel = await claim(db, a, 'Spot St', fakeStreet(1.4, 51, 200));
+    await api(db, 'tycoon_buy', { ...a, parcel_id: parcel.id });
+    const r = await api(db, 'tycoon_build', { ...a, parcel_id: parcel.id, type_id: 'house', lon: 1.4005, lat: 51.0001, bearing: -90 });
+    expect(r.parcel.improvements[0]).toMatchObject({ lon: 1.4005, lat: 51.0001, bearing: 270 });
+    expect(await apiError(db, 'tycoon_build', { ...a, parcel_id: parcel.id, type_id: 'house', lon: 1.5, lat: 51.2, bearing: 0 }))
+      .toContain('invalid_location');
+    expect(await apiError(db, 'tycoon_build', { ...a, parcel_id: parcel.id, type_id: 'house', lon: 1.4005 }))
+      .toContain('invalid_location');
+  });
+});
+
 describe('database privileges', () => {
   it('ledger is append-only even for the owner', async () => {
     await expect(db.q(`UPDATE tycoon.ledger SET amount = amount + 1`)).rejects.toThrow(/append_only/);

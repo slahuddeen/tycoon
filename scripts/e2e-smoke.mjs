@@ -157,10 +157,16 @@ try {
   await page.click('[data-action=close-modal]');
   step('entered world');
 
-  await page.evaluate((c) => window.tycoon.gm.map.jumpTo({ center: c, zoom: 16.6, pitch: 50, bearing: -20 }), CENTER);
+  await page.evaluate((c) => window.tycoon.gm.map.jumpTo({ center: c, zoom: 16.6, pitch: 0, bearing: -20 }), CENTER);
   await page.waitForTimeout(1500);
   const clickAt = async (lonlat) => {
-    const pt = await page.evaluate((ll) => { const p = window.tycoon.gm.map.project(ll); return [p.x, p.y]; }, lonlat);
+    let pt = await page.evaluate((ll) => { const p = window.tycoon.gm.map.project(ll); return [p.x, p.y]; }, lonlat);
+    // Something (the live feed, a panel) covering that spot? Bring it to the middle of the map first.
+    if (!(await page.evaluate(([x, y]) => document.elementFromPoint(x, y)?.tagName === 'CANVAS', pt))) {
+      await page.evaluate((ll) => window.tycoon.gm.map.jumpTo({ center: ll }), lonlat);
+      await page.waitForTimeout(1200);
+      pt = await page.evaluate((ll) => { const p = window.tycoon.gm.map.project(ll); return [p.x, p.y]; }, lonlat);
+    }
     await page.mouse.click(pt[0], pt[1]);
   };
   async function buyAndBuild(lonlat, expect, plan) {
@@ -194,9 +200,40 @@ try {
   }
   await page.waitForTimeout(1200);
   await shot('4-built.png');
+  const placed = await page.evaluate(() => [...window.tycoon.gm.buildings['live'].values()].filter((l) => l.spec.placed).length);
+  step(`player buildings on open ground: ${placed}`);
+  if (placed < 3) throw new Error('expected new buildings to be placed on open ground');
+
+  // Buy a real house on Duke Street: look straight down on it and click its roof.
+  const office = [CENTER[0] - dLon + 29 / mPerLon, CENTER[1] + dLat + 15 / mPerLat];
+  await page.click('[data-action=close-panel]');
+  await page.evaluate((c) => window.tycoon.gm.map.jumpTo({ center: c, zoom: 18, pitch: 0, bearing: 0 }), office);
+  await page.waitForTimeout(2500);
+  await clickAt(office);
+  await page.waitForSelector('[data-action=buy-building]', { timeout: 20000 });
+  await shot('4b-real-building.png');
+  const quoted = await page.evaluate(() => window.tycoon.state.building?.quote);
+  const off = Math.hypot((quoted.lon - office[0]) * mPerLon, (quoted.lat - office[1]) * mPerLat);
+  step(`picked the building under the cursor (${off.toFixed(1)} m off, ${quoted.area_m2} m², ${quoted.floors} floors)`);
+  if (off > 3 || Math.abs(quoted.area_m2 - 120) > 8) throw new Error('picked the wrong building');
+  await page.click('[data-action=buy-building]');
+  await page.waitForFunction(() => document.querySelector('#panel .owner.mine')?.textContent?.includes('You own this building'), null, { timeout: 15000 });
+  await page.waitForFunction(() => window.tycoon.gm.cityStats().bought > 0, null, { timeout: 20000 }).catch(() => {});
+  const bought = await page.evaluate(() => window.tycoon.gm.cityStats().bought);
+  step(`bought a real building (${bought} shown as bought)`);
+  if (bought < 1) throw new Error('bought building should be drawn in the owner colour');
+  await page.click('[data-action=close-panel]');
+
+  // The camera can come right down to street level.
+  await page.click('.camera-ctrl button >> nth=0');
+  await page.waitForTimeout(2000);
+  const pitch = await page.evaluate(() => window.tycoon.gm.map.getPitch());
+  step(`street-level camera pitch: ${pitch.toFixed(0)}°`);
+  if (pitch < 75) throw new Error('camera should tilt down to street level');
+  await shot('4c-street-level.png');
 
   // Player 2 (a rival in the same browser sandbox) buys the next street.
-  await page.click('[data-action=close-panel]');
+  if (await page.isVisible('#panel')) await page.click('[data-action=close-panel]');
   await page.click('[data-action=switch-world]');
   await page.click('[data-action=logout]');
   await page.click('[data-action=tab-register]');
@@ -207,7 +244,7 @@ try {
   await page.click('.world >> nth=0');
   await page.waitForSelector('#hud:not([hidden])', { timeout: 30000 });
   if (await page.$('#modal:not([hidden])')) await page.click('[data-action=close-modal]');
-  await page.evaluate((c) => window.tycoon.gm.map.jumpTo({ center: c, zoom: 16.6, pitch: 50, bearing: -20 }), CENTER);
+  await page.evaluate((c) => window.tycoon.gm.map.jumpTo({ center: c, zoom: 16.6, pitch: 0, bearing: -20 }), CENTER);
   await page.waitForTimeout(1500);
   const n2 = await buyAndBuild([CENTER[0] - 0.0012, CENTER[1] + 2 * dLat], 'Elm Row', ['shops', 'terrace', 'house', 'cottage', 'cottage']);
   step(`player 2 bought Elm Row, ${n2} buildings`);
@@ -222,8 +259,11 @@ try {
   const visible = await page.evaluate(() => window.tycoon.gm.buildings['live'].size);
   step(`3D buildings in scene: ${visible}`);
   if (visible < 5) throw new Error('expected 3D buildings in the scene');
+  // Software rendering is slow: let every tile in view finish rebuilding first.
+  await page.waitForFunction(() => window.tycoon.gm['cityPending'].size === 0 && !window.tycoon.gm['pumping'], null, { timeout: 30000 });
   const city = await page.evaluate(() => window.tycoon.gm.cityStats());
-  step(`real buildings modelled: ${city.buildings} (${city.mine} yours, ${city.other} rival's, ${city.cleared} cleared for construction) kinds=${JSON.stringify(city.kinds)}`);
+  step(`real buildings modelled: ${city.buildings} (${city.mine} yours, ${city.other} rival's, ${city.bought} bought, ${city.cleared} cleared) kinds=${JSON.stringify(city.kinds)}`);
+  if (city.cleared) throw new Error('real buildings should never be cleared for new ones');
   if (city.buildings < 20 || city.mine < 1 || city.other < 1) throw new Error('expected coloured real 3D buildings');
   if (!city.kinds.house || !(city.kinds.tower || city.kinds.skyscraper)) throw new Error('expected houses and towers');
   // Close-up of the rooftops.

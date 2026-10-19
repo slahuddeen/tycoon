@@ -7,20 +7,61 @@ import 'maplibre-gl/dist/maplibre-gl.css';
 // the copy Vite emits so it also works from a GitHub Pages sub-path.
 import workerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?url';
 import { BuildingLayer, CITY_MIN_ZOOM, COLORS, footprint, MIN_3D_ZOOM, placeImprovements, type BuildingSpec } from './buildings3d';
-import { buildTile, TileFrame, tileFootprints, type CityStats, type Ownership } from './city3d';
+import { buildingGeometry, buildTile, classify, TileFrame, tileFootprints, type CityStats, type Drawn, type Footprint, type Kind, type Ownership } from './city3d';
 import type { Parcel } from './format';
 import { streetFromTiles, type LonLat, type StreetCandidate, type TileRoad } from './osm';
+import type { Obstacles } from './placement';
 
 export const BASEMAP_STYLE = 'https://tiles.openfreemap.org/styles/positron';
 export const PARCEL_MIN_ZOOM = 11;
 /** Real buildings within this many metres of a street count as "on" it. */
 const FRONTAGE_M = 22;
-const CITY_COLORS = { base: '#e3e2de', baseTall: '#cfd3d9', mine: '#3fcf98', other: '#f2837b' };
+const CITY_COLORS = { base: '#e3e2de', baseTall: '#cfd3d9', mine: '#a9e3c6', other: '#f2bdb6' };
 // `distance` needs some geometry; this point is nowhere near anything.
 const NOWHERE: GeoJSON.Geometry = { type: 'Point', coordinates: [0, -84] };
 
 type OwnedPoint = [number, number, number, string];   // id, lon, lat, owner
 
+/** A real building picked on the map. */
+export interface RealBuilding {
+  outline: LonLat[];
+  centre: LonLat;
+  height: number;
+  kind: Kind;
+  /** For drawing its highlight. */
+  fp: Footprint;
+  anchor: LonLat;
+}
+
+// Roughly how wide each kind of road is, either side of its centreline.
+const ROAD_HALF_WIDTH: Record<string, number> = {
+  motorway: 9, trunk: 8, primary: 6.5, secondary: 6, tertiary: 5, minor: 4, service: 2.5,
+  track: 1.5, path: 1, rail: 3, transit: 2.5, busway: 4, raceway: 5,
+};
+
+/** Low-angle and overhead camera presets (drag with the right mouse button, or Ctrl+drag, to orbit freely). */
+class CameraControl implements maplibregl.IControl {
+  private el!: HTMLElement;
+  onAdd(map: MlMap) {
+    this.el = document.createElement('div');
+    this.el.className = 'maplibregl-ctrl maplibregl-ctrl-group camera-ctrl';
+    const button = (label: string, title: string, go: () => void) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.title = title;
+      b.setAttribute('aria-label', title);
+      b.textContent = label;
+      b.addEventListener('click', go);
+      this.el.appendChild(b);
+    };
+    button('🚶', 'Street level: tilt right down', () =>
+      map.easeTo({ pitch: 80, zoom: Math.max(map.getZoom(), 17.5), duration: 1200 }));
+    button('🏙️', 'Angled view', () => map.easeTo({ pitch: 55, duration: 1000 }));
+    button('🛰️', 'Straight down, north up', () => map.easeTo({ pitch: 0, bearing: 0, duration: 1000 }));
+    return this.el;
+  }
+  onRemove() { this.el.remove(); }
+}
 maplibregl.setWorkerUrl(workerUrl);
 
 export class GameMap {
@@ -34,11 +75,13 @@ export class GameMap {
   private tiles: string | null = null;
   private citySignature = '';
   private cityOwn: Ownership = { mine: [], other: [], cleared: [] };
-  private cityBuilt = new Map<string, { sig: string; stats: CityStats }>();
+  private cityBuilt = new Map<string, { sig: string; stats: CityStats; frame: TileFrame; drawn: Drawn[] }>();
+  private specs: BuildingSpec[] = [];
   private cityPending = new Map<string, { z: number; x: number; y: number; extent: number; feats: any[]; sig: string }>();
   private cityTimer = 0;
 
   onParcelClick: (id: number) => void = () => {};
+  onBuildingClick: (b: RealBuilding) => void = () => {};
   onEmptyClick: (at: LonLat, zoom: number) => void = () => {};
   onViewChange: () => void = () => {};
 
@@ -48,16 +91,26 @@ export class GameMap {
       style: BASEMAP_STYLE,
       center: [-0.1276, 51.5072],
       zoom: 1.6,
-      maxPitch: 60,
+      // Tilt right down to street level (MapLibre allows up to 85° without looking underground).
+      maxPitch: 85,
+      maxZoom: 21,
       attributionControl: { compact: true, customAttribution: '© OpenStreetMap contributors' },
     });
     this.map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'bottom-right');
+    this.map.addControl(new CameraControl(), 'bottom-right');
     this.map.addControl(new maplibregl.GeolocateControl({ fitBoundsOptions: { maxZoom: 16 } }), 'bottom-right');
     this.map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
 
     this.ready = new Promise((resolve) => {
       this.map.once('load', () => {
         this.styleBasemap();
+        // A soft sky for low camera angles.
+        try {
+          this.map.setSky({
+            'sky-color': '#bcd7ee', 'sky-horizon-blend': 0.6, 'horizon-color': '#eef2f5',
+            'horizon-fog-blend': 0.7, 'fog-color': '#eceeec', 'fog-ground-blend': 0.75,
+          } as any);
+        } catch { /* older style spec */ }
         this.addLayers();
         resolve();
       });
@@ -126,25 +179,38 @@ export class GameMap {
     this.map.setFilter('city-3d-other', [...shown, not(near(mine, FRONTAGE_M)), near(other, FRONTAGE_M)] as any);
   }
 
-  /** Recolour real buildings when what's owned or built in view changes. */
+  /**
+   * Recolour real buildings when what's owned, bought or built in view
+   * changes. Real buildings are never knocked down, except under the few
+   * older player buildings that were put on their plot before buildings
+   * went on empty ground.
+   */
   private updateCity(specs: BuildingSpec[]) {
     const mine: LonLat[][] = [], other: LonLat[][] = [];
+    const bought = { mine: [] as LonLat[], other: [] as LonLat[] };
     const sig: string[] = [];
     for (const p of this.parcels.values()) {
       if (!p.owner_id) continue;
-      (p.owner_id === this.myPlayerId ? mine : other).push(...p.geom);
-      sig.push(`${p.id}:${p.owner_id === this.myPlayerId ? 'm' : 'o'}`);
+      const isMine = p.owner_id === this.myPlayerId;
+      (isMine ? mine : other).push(...p.geom);
+      sig.push(`${p.id}:${isMine ? 'm' : 'o'}`);
+      for (const i of p.improvements ?? []) {
+        if (i.type_id !== 'real' || i.lon == null || i.lat == null) continue;
+        (isMine ? bought.mine : bought.other).push([i.lon, i.lat]);
+        sig.push(`r${i.id}`);
+      }
     }
-    for (const b of specs) sig.push(b.key);
+    const legacy = specs.filter((b) => !b.placed);
+    for (const b of legacy) sig.push(b.key);
     const signature = sig.sort().join(',');
     if (signature === this.citySignature) return;
     this.citySignature = signature;
     const lines = (l: LonLat[][]): GeoJSON.Geometry => (l.length ? { type: 'MultiLineString', coordinates: l } : NOWHERE);
-    const cleared: GeoJSON.Geometry = specs.length
-      ? { type: 'MultiPolygon', coordinates: specs.map((b) => [footprint(b)]) }
+    const cleared: GeoJSON.Geometry = legacy.length
+      ? { type: 'MultiPolygon', coordinates: legacy.map((b) => [footprint(b)]) }
       : NOWHERE;
     this.setCityFilters(lines(mine), lines(other), cleared);
-    this.cityOwn = { mine, other, cleared: specs.map((b) => footprint(b)) };
+    this.cityOwn = { mine, other, cleared: legacy.map((b) => footprint(b)), bought };
     this.scheduleCity();
   }
 
@@ -202,21 +268,82 @@ export class GameMap {
         height: Number(f.properties.render_height ?? f.properties.height ?? 6),
         minHeight: Number(f.properties.render_min_height ?? f.properties.min_height ?? 0),
       })));
-      const { geometry, stats } = buildTile(frame, fps, this.cityOwn, FRONTAGE_M);
+      const { geometry, stats, drawn } = buildTile(frame, fps, this.cityOwn, FRONTAGE_M);
       this.buildings.setCityTile(key, frame.anchor, geometry);
-      this.cityBuilt.set(key, { sig: t.sig, stats });
+      this.cityBuilt.set(key, { sig: t.sig, stats, frame, drawn });
       this.pumpCity();
     });
   }
 
   /** Totals across built tiles (used by tests and for debugging). */
   cityStats(): CityStats {
-    const total: CityStats = { buildings: 0, mine: 0, other: 0, cleared: 0, kinds: {} };
+    const total: CityStats = { buildings: 0, mine: 0, other: 0, bought: 0, cleared: 0, kinds: {} };
     for (const { stats } of this.cityBuilt.values()) {
-      total.buildings += stats.buildings; total.mine += stats.mine; total.other += stats.other; total.cleared += stats.cleared;
+      total.buildings += stats.buildings; total.mine += stats.mine; total.other += stats.other;
+      total.bought += stats.bought; total.cleared += stats.cleared;
       for (const [k, n] of Object.entries(stats.kinds)) total.kinds[k as keyof CityStats['kinds']] = (total.kinds[k as keyof CityStats['kinds']] ?? 0) + (n ?? 0);
     }
     return total;
+  }
+
+  /** The real building drawn under a screen point, if any. */
+  realBuildingAt(x: number, y: number): RealBuilding | null {
+    const hit = this.buildings.pickCity(x, y);
+    const t = hit && this.cityBuilt.get(hit.tile);
+    if (!hit || !t || !t.drawn.length) return null;
+    let lo = 0, hi = t.drawn.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi + 1) >> 1;
+      if (t.drawn[mid].tri <= hit.face) lo = mid; else hi = mid - 1;
+    }
+    const fp = t.drawn[lo].fp;
+    let cx = 0, cz = 0;
+    for (const p of fp.outer) { cx += p[0]; cz += p[1]; }
+    return {
+      outline: fp.outer.map((p) => t.frame.toLonLat(p)),
+      centre: t.frame.toLonLat([cx / fp.outer.length, cz / fp.outer.length]),
+      height: fp.height,
+      kind: classify(fp).kind,
+      fp,
+      anchor: t.frame.anchor,
+    };
+  }
+
+  /** Light up one real building (null clears it). */
+  highlightBuilding(b: RealBuilding | null) {
+    this.buildings.setHighlight(b?.anchor ?? null, b ? buildingGeometry(b.fp) : null);
+  }
+
+  /** What a new building must keep clear of, from the loaded map tiles. */
+  obstacles(): Obstacles {
+    const buildings: LonLat[][] = [];
+    const roads: Obstacles['roads'] = [];
+    if (this.tiles) {
+      for (const layer of ['building', 'water']) {
+        for (const f of this.map.querySourceFeatures(this.tiles, { sourceLayer: layer })) {
+          const g = f.geometry;
+          if (g.type === 'Polygon') buildings.push(g.coordinates[0] as LonLat[]);
+          else if (g.type === 'MultiPolygon') for (const poly of g.coordinates) buildings.push(poly[0] as LonLat[]);
+        }
+      }
+      for (const f of this.map.querySourceFeatures(this.tiles, { sourceLayer: 'transportation' })) {
+        if (f.properties.brunnel === 'tunnel') continue;
+        const hw = ROAD_HALF_WIDTH[String(f.properties.class)];
+        if (!hw) continue;
+        const g = f.geometry;
+        if (g.type === 'LineString') roads.push({ line: g.coordinates as LonLat[], halfWidth: hw });
+        else if (g.type === 'MultiLineString') for (const line of g.coordinates) roads.push({ line: line as LonLat[], halfWidth: hw });
+      }
+    }
+    for (const s of this.specs) buildings.push(footprint(s, 0));
+    return { buildings, roads };
+  }
+
+  /** The map view's bounds, slightly inset. */
+  visibleBounds() {
+    const b = this.map.getBounds();
+    const padLon = (b.getEast() - b.getWest()) * 0.05, padLat = (b.getNorth() - b.getSouth()) * 0.05;
+    return { west: b.getWest() + padLon, south: b.getSouth() + padLat, east: b.getEast() - padLon, north: b.getNorth() - padLat };
   }
 
   /**
@@ -315,6 +442,7 @@ export class GameMap {
       specs.push(...placeImprovements(p, this.myPlayerId));
     }
     (this.map.getSource('parcels') as GeoJSONSource | undefined)?.setData({ type: 'FeatureCollection', features });
+    this.specs = specs;
     this.buildings.setBuildings(specs);
     this.updateCity(specs);
   }
@@ -402,6 +530,8 @@ export class GameMap {
   private handleClick(point: maplibregl.Point, at: LonLat) {
     const hit = this.buildings.hitTest(point.x, point.y);
     if (hit != null) return this.onParcelClick(hit);
+    const real = this.map.getZoom() >= CITY_MIN_ZOOM ? this.realBuildingAt(point.x, point.y) : null;
+    if (real) return this.onBuildingClick(real);
     const pad = 10;
     const box: [maplibregl.PointLike, maplibregl.PointLike] = [[point.x - pad, point.y - pad], [point.x + pad, point.y + pad]];
     const dots = this.map.getLayer('owned-dots') ? this.map.queryRenderedFeatures(box, { layers: ['owned-dots'] }) : [];

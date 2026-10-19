@@ -25,6 +25,27 @@ $$;
 CREATE OR REPLACE FUNCTION tycoon.metres_to_lat_deg(p_m DOUBLE PRECISION)
 RETURNS DOUBLE PRECISION LANGUAGE sql IMMUTABLE AS $$ SELECT p_m / 111320.0 $$;
 
+-- Shortest distance in metres from a point to a street's line parts
+-- ([[[lon,lat], ...], ...]), on a flat local projection (fine at street scale).
+CREATE OR REPLACE FUNCTION tycoon.dist_to_lines_m(p_lon DOUBLE PRECISION, p_lat DOUBLE PRECISION, p_lines JSONB)
+RETURNS DOUBLE PRECISION LANGUAGE sql IMMUTABLE AS $$
+  WITH pts AS (
+    SELECT l.idx, pt.ord,
+           ((pt.v ->> 0)::FLOAT8 - p_lon) * 111320.0 * cos(radians(p_lat)) AS x,
+           ((pt.v ->> 1)::FLOAT8 - p_lat) * 111320.0 AS y
+      FROM jsonb_array_elements(p_lines) WITH ORDINALITY AS l(v, idx)
+      CROSS JOIN LATERAL jsonb_array_elements(l.v) WITH ORDINALITY AS pt(v, ord)),
+  segs AS (
+    SELECT lag(x) OVER w AS ax, lag(y) OVER w AS ay, x AS bx, y AS by FROM pts
+    WINDOW w AS (PARTITION BY idx ORDER BY ord)),
+  t AS (
+    SELECT ax, ay, bx, by,
+           CASE WHEN (bx - ax) ^ 2 + (by - ay) ^ 2 = 0 THEN 0
+                ELSE GREATEST(0, LEAST(1, (-(ax) * (bx - ax) - ay * (by - ay)) / ((bx - ax) ^ 2 + (by - ay) ^ 2))) END AS k
+      FROM segs WHERE ax IS NOT NULL)
+  SELECT min(sqrt((ax + k * (bx - ax)) ^ 2 + (ay + k * (by - ay)) ^ 2)) FROM t
+$$;
+
 CREATE OR REPLACE FUNCTION tycoon.world_config(p_world UUID)
 RETURNS JSONB LANGUAGE sql STABLE AS $$
   SELECT r.config FROM tycoon.worlds w JOIN tycoon.rulesets r ON r.id = w.ruleset_id
@@ -193,7 +214,7 @@ LANGUAGE sql STABLE AS $$
   SELECT v.id, v.owner_id,
          tycoon.apply_bp(v.land_value, COALESCE((p_cfg ->> 'vacancy_penalty_bp')::NUMERIC, 0))
   FROM tycoon.parcel_vars(p_world, p_cfg) v
-  WHERE v.slots_used = 0
+  WHERE NOT EXISTS (SELECT 1 FROM tycoon.improvements i WHERE i.parcel_id = v.id)
 $$;
 
 -- Density weight for a location: grows with the number of parcels nearby.
@@ -431,9 +452,15 @@ END $$;
 
 -- p_slot: the plot to build on (optional). Without one, the free run of
 -- plots closest to the middle of the street is used.
+-- p_lon/p_lat/p_bearing (optional): the empty spot beside the street the
+-- building stands on, which the browser picks clear of the real buildings.
 DROP FUNCTION IF EXISTS tycoon.build_improvement(UUID, BIGINT, TEXT);
+DROP FUNCTION IF EXISTS tycoon.build_improvement(UUID, BIGINT, TEXT, INT);
 CREATE OR REPLACE FUNCTION tycoon.build_improvement(p_player UUID, p_parcel BIGINT, p_type TEXT,
-                                                    p_slot INT DEFAULT NULL)
+                                                    p_slot INT DEFAULT NULL,
+                                                    p_lon DOUBLE PRECISION DEFAULT NULL,
+                                                    p_lat DOUBLE PRECISION DEFAULT NULL,
+                                                    p_bearing DOUBLE PRECISION DEFAULT NULL)
 RETURNS BIGINT LANGUAGE plpgsql AS $$
 DECLARE
   pl tycoon.players := tycoon.lock_player(p_player);
@@ -446,8 +473,15 @@ BEGIN
   IF NOT FOUND THEN RAISE EXCEPTION 'parcel_not_found'; END IF;
   IF p.world_id <> pl.world_id THEN RAISE EXCEPTION 'wrong_world'; END IF;
   IF p.owner_id IS DISTINCT FROM p_player THEN RAISE EXCEPTION 'not_owner'; END IF;
-  SELECT * INTO bt FROM tycoon.building_types WHERE id = p_type;
+  SELECT * INTO bt FROM tycoon.building_types WHERE id = p_type AND buildable;
   IF NOT FOUND THEN RAISE EXCEPTION 'unknown_building_type'; END IF;
+  IF p_lon IS NOT NULL OR p_lat IS NOT NULL OR p_bearing IS NOT NULL THEN
+    IF p_lon IS NULL OR p_lat IS NULL OR p_bearing IS NULL
+       OR p_lon NOT BETWEEN -180 AND 180 OR p_lat NOT BETWEEN -85 AND 85
+       OR tycoon.dist_to_lines_m(p_lon, p_lat, p.geom) > 150 THEN
+      RAISE EXCEPTION 'invalid_location';
+    END IF;
+  END IF;
 
   -- A run of free consecutive plots big enough for this building: the one
   -- requested, or else the one nearest the middle of the street.
@@ -470,8 +504,9 @@ BEGIN
 
   INSERT INTO tycoon.ledger (world_id, from_account, to_account, amount, reason, parcel_id)
   VALUES (p.world_id, acct, 'bank', bt.cost, 'build', p.id);
-  INSERT INTO tycoon.improvements (parcel_id, type_id, cost, slots_used, slot_index)
-  VALUES (p.id, bt.id, bt.cost, bt.slots_used, v_slot);
+  INSERT INTO tycoon.improvements (parcel_id, type_id, cost, slots_used, slot_index, lon, lat, bearing)
+  VALUES (p.id, bt.id, bt.cost, bt.slots_used, v_slot, p_lon, p_lat,
+          CASE WHEN p_bearing IS NOT NULL THEN p_bearing - 360 * floor(p_bearing / 360) END);
   UPDATE tycoon.parcels SET improvement_value = improvement_value + bt.cost WHERE id = p.id;
 
   INSERT INTO tycoon.events (world_id, player_id, kind, parcel_id, data)
@@ -491,11 +526,142 @@ BEGIN
   SELECT * INTO p FROM tycoon.parcels WHERE id = imp.parcel_id FOR UPDATE;
   IF p.world_id <> pl.world_id THEN RAISE EXCEPTION 'wrong_world'; END IF;
   IF p.owner_id IS DISTINCT FROM p_player THEN RAISE EXCEPTION 'not_owner'; END IF;
+  IF imp.outline IS NOT NULL THEN RAISE EXCEPTION 'cannot_demolish_real_building'; END IF;
   DELETE FROM tycoon.improvements WHERE id = imp.id;
   UPDATE tycoon.parcels SET improvement_value = GREATEST(improvement_value - imp.cost, 0) WHERE id = p.id;
   INSERT INTO tycoon.events (world_id, player_id, kind, parcel_id, data)
   VALUES (p.world_id, p_player, 'demolish', p.id, jsonb_build_object('type_id', imp.type_id));
   RETURN tycoon.balance_of(p.world_id, tycoon.player_account(p_player));
+END $$;
+
+-- ---------------------------------------------------------------------
+-- Real buildings. The browser sends a building's outline and height from
+-- the map tiles; the server measures it, values it with the ruleset's
+-- real_buildings.value formula, and (when bought) records it as an
+-- improvement on the street it fronts, so it earns and is taxed like any
+-- other building. Real buildings can't be demolished or moved.
+-- p_outline: [[lon,lat], ...]
+-- ---------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION tycoon.real_building_quote(p_parcel BIGINT, p_outline JSONB, p_height DOUBLE PRECISION)
+RETURNS JSONB LANGUAGE plpgsql AS $$
+DECLARE
+  p tycoon.parcels;
+  cfg JSONB;
+  rb JSONB;
+  c RECORD;
+  v_area DOUBLE PRECISION;
+  v_h DOUBLE PRECISION;
+  v_floors INT;
+  v_fa DOUBLE PRECISION;
+  v_value NUMERIC;
+  v_income BIGINT;
+  owner RECORD;
+BEGIN
+  SELECT * INTO p FROM tycoon.parcels WHERE id = p_parcel;
+  IF NOT FOUND THEN RAISE EXCEPTION 'parcel_not_found'; END IF;
+  cfg := tycoon.world_config(p.world_id);
+  rb := cfg -> 'real_buildings';
+  IF rb IS NULL THEN RAISE EXCEPTION 'real_buildings_not_for_sale'; END IF;
+  IF jsonb_typeof(p_outline) IS DISTINCT FROM 'array' OR jsonb_array_length(p_outline) NOT BETWEEN 3 AND 500
+     OR p_height IS NULL OR p_height <= 0 OR p_height > 1000 THEN
+    RAISE EXCEPTION 'invalid_building';
+  END IF;
+
+  CREATE TEMP TABLE IF NOT EXISTS _rb_pts (ord INT, lon FLOAT8, lat FLOAT8) ON COMMIT DROP;
+  TRUNCATE _rb_pts;
+  INSERT INTO _rb_pts
+  SELECT pt.ord::INT,
+         CASE WHEN jsonb_typeof(pt.v -> 0) = 'number' THEN (pt.v ->> 0)::FLOAT8 END,
+         CASE WHEN jsonb_typeof(pt.v -> 1) = 'number' THEN (pt.v ->> 1)::FLOAT8 END
+    FROM jsonb_array_elements(p_outline) WITH ORDINALITY AS pt(v, ord);
+  IF EXISTS (SELECT 1 FROM _rb_pts WHERE lon IS NULL OR lat IS NULL
+               OR lon NOT BETWEEN -180 AND 180 OR lat NOT BETWEEN -85 AND 85) THEN
+    RAISE EXCEPTION 'invalid_building';
+  END IF;
+
+  SELECT avg(lon) AS lon, avg(lat) AS lat, max(lon) - min(lon) AS dlon, max(lat) - min(lat) AS dlat
+    INTO c FROM _rb_pts;
+  IF c.dlat * 111320 > 1500 OR c.dlon * 111320 * cos(radians(c.lat)) > 1500 THEN
+    RAISE EXCEPTION 'invalid_building';
+  END IF;
+  -- Shoelace area on a local flat projection.
+  SELECT abs(SUM(x0 * y1 - x1 * y0)) / 2 INTO v_area FROM (
+    SELECT (lon - c.lon) * 111320 * cos(radians(c.lat)) AS x0, (lat - c.lat) * 111320 AS y0,
+           (lead(lon, 1, first_lon) OVER w - c.lon) * 111320 * cos(radians(c.lat)) AS x1,
+           (lead(lat, 1, first_lat) OVER w - c.lat) * 111320 AS y1
+      FROM (SELECT *, first_value(lon) OVER (ORDER BY ord) AS first_lon,
+                      first_value(lat) OVER (ORDER BY ord) AS first_lat FROM _rb_pts) q
+    WINDOW w AS (ORDER BY ord)) s;
+  IF v_area IS NULL OR v_area < 8 THEN RAISE EXCEPTION 'invalid_building'; END IF;
+  IF tycoon.dist_to_lines_m(c.lon, c.lat, p.geom) > (rb ->> 'max_frontage_m')::FLOAT8 THEN
+    RAISE EXCEPTION 'building_not_on_street';
+  END IF;
+
+  v_h := p_height;
+  v_floors := LEAST((rb ->> 'max_floors')::INT,
+                    GREATEST(1, round(v_h / (rb ->> 'floor_height_m')::FLOAT8)::INT));
+  v_fa := v_area * v_floors;
+  EXECUTE format('SELECT %s FROM (SELECT $1::NUMERIC AS floor_area_m2, $2::NUMERIC AS density_weight, '
+                 '$3::NUMERIC AS height_m, $4::NUMERIC AS class_weight) v',
+                 tycoon.compile_expr(rb ->> 'value', ARRAY['floor_area_m2', 'density_weight', 'height_m', 'class_weight']))
+    INTO v_value
+    USING v_fa, p.density_weight, v_h, (cfg -> 'valuation' -> 'class_weights' ->> p.highway_class)::NUMERIC;
+  v_value := GREATEST(round(v_value), 1);
+  SELECT tycoon.apply_bp(tycoon.apply_bp(v_value, bt.yield_bp), (cfg -> 'income' ->> 'from_improvements_bp')::NUMERIC)
+    INTO v_income FROM tycoon.building_types bt WHERE bt.id = 'real';
+
+  -- Already bought? (Same spot, give or take, anywhere in this world.)
+  SELECT i.id, i.parcel_id, q.owner_id, (SELECT handle FROM tycoon.players WHERE id = q.owner_id) AS handle
+    INTO owner
+    FROM tycoon.improvements i JOIN tycoon.parcels q ON q.id = i.parcel_id
+   WHERE i.outline IS NOT NULL AND q.world_id = p.world_id
+     AND i.lat BETWEEN c.lat - tycoon.metres_to_lat_deg(4) AND c.lat + tycoon.metres_to_lat_deg(4)
+     AND tycoon.geo_dist_m(i.lat, i.lon, c.lat, c.lon) < 4
+   ORDER BY tycoon.geo_dist_m(i.lat, i.lon, c.lat, c.lon)
+   LIMIT 1;
+
+  RETURN jsonb_build_object(
+    'parcel_id', p.id, 'lon', c.lon, 'lat', c.lat,
+    'area_m2', round(v_area::NUMERIC, 1), 'height_m', round(v_h::NUMERIC, 1),
+    'floors', v_floors, 'floor_area_m2', round(v_fa::NUMERIC), 'value', v_value::BIGINT,
+    'income_per_tick', v_income,
+    'improvement_id', owner.id, 'owned_parcel_id', owner.parcel_id,
+    'owner_id', owner.owner_id, 'owner_handle', owner.handle);
+END $$;
+
+CREATE OR REPLACE FUNCTION tycoon.buy_real_building(p_player UUID, p_parcel BIGINT, p_outline JSONB,
+                                                    p_height DOUBLE PRECISION)
+RETURNS BIGINT LANGUAGE plpgsql AS $$
+DECLARE
+  pl tycoon.players := tycoon.lock_player(p_player);
+  p tycoon.parcels;
+  q JSONB;
+  acct TEXT := tycoon.player_account(p_player);
+BEGIN
+  SELECT * INTO p FROM tycoon.parcels WHERE id = p_parcel FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'parcel_not_found'; END IF;
+  IF p.world_id <> pl.world_id THEN RAISE EXCEPTION 'wrong_world'; END IF;
+  IF p.owner_id IS DISTINCT FROM p_player THEN RAISE EXCEPTION 'not_owner'; END IF;
+  -- One buyer at a time per world, so a building is never sold twice.
+  PERFORM pg_advisory_xact_lock(hashtext('tycoon-real-building'), hashtext(p.world_id::TEXT));
+  q := tycoon.real_building_quote(p.id, p_outline, p_height);
+  IF q ->> 'improvement_id' IS NOT NULL THEN RAISE EXCEPTION 'building_already_owned'; END IF;
+  IF tycoon.balance_of(p.world_id, acct) < (q ->> 'value')::BIGINT THEN
+    RAISE EXCEPTION 'insufficient_funds';
+  END IF;
+
+  INSERT INTO tycoon.ledger (world_id, from_account, to_account, amount, reason, parcel_id)
+  VALUES (p.world_id, acct, 'bank', (q ->> 'value')::BIGINT, 'building_purchase', p.id);
+  INSERT INTO tycoon.improvements (parcel_id, type_id, cost, slots_used, slot_index,
+                                   lon, lat, outline, height_m, floor_area_m2)
+  VALUES (p.id, 'real', (q ->> 'value')::BIGINT, 0, -1, (q ->> 'lon')::FLOAT8, (q ->> 'lat')::FLOAT8,
+          p_outline, (q ->> 'height_m')::FLOAT8, (q ->> 'floor_area_m2')::FLOAT8);
+  UPDATE tycoon.parcels SET improvement_value = improvement_value + (q ->> 'value')::BIGINT WHERE id = p.id;
+
+  INSERT INTO tycoon.events (world_id, player_id, kind, parcel_id, data)
+  VALUES (p.world_id, p_player, 'buy_building', p.id,
+          jsonb_build_object('type_id', 'real', 'floors', q -> 'floors', 'value', q -> 'value'));
+  RETURN tycoon.balance_of(p.world_id, acct);
 END $$;
 
 -- Hand a street back to the bank. No money changes hands: the only ways

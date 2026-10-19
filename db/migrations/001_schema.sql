@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS tycoon.building_types (
   yield_bp     INT NOT NULL CHECK (yield_bp >= 0),
   sort_order   INT NOT NULL DEFAULT 0
 );
+-- Non-buildable types (real buildings bought off the map) never appear in the build menu.
+ALTER TABLE tycoon.building_types ADD COLUMN IF NOT EXISTS buildable BOOLEAN NOT NULL DEFAULT true;
 
 CREATE TABLE IF NOT EXISTS tycoon.improvements (
   id           BIGSERIAL PRIMARY KEY,
@@ -123,6 +125,16 @@ CREATE TABLE IF NOT EXISTS tycoon.improvements (
   built_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS improvements_parcel_idx ON tycoon.improvements (parcel_id);
+-- Where a building stands. Player buildings: the empty spot the builder
+-- chose (NULL for buildings made before that, which sit on their plot).
+-- Real buildings bought off the map also keep their outline and size.
+ALTER TABLE tycoon.improvements ADD COLUMN IF NOT EXISTS lon DOUBLE PRECISION;
+ALTER TABLE tycoon.improvements ADD COLUMN IF NOT EXISTS lat DOUBLE PRECISION;
+ALTER TABLE tycoon.improvements ADD COLUMN IF NOT EXISTS bearing DOUBLE PRECISION;
+ALTER TABLE tycoon.improvements ADD COLUMN IF NOT EXISTS outline JSONB;
+ALTER TABLE tycoon.improvements ADD COLUMN IF NOT EXISTS height_m DOUBLE PRECISION;
+ALTER TABLE tycoon.improvements ADD COLUMN IF NOT EXISTS floor_area_m2 DOUBLE PRECISION;
+CREATE INDEX IF NOT EXISTS improvements_lat_idx ON tycoon.improvements (lat) WHERE outline IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS tycoon.ticks (
   id               BIGSERIAL PRIMARY KEY,

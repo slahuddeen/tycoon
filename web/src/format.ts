@@ -2,7 +2,20 @@ import type { LonLat } from './osm';
 
 export interface Currency { code: string; symbol?: string; minor_units: number }
 
-export interface Improvement { id: number; type_id: string; slot_index: number; slots_used: number; cost: number; built_at?: string }
+export interface Improvement {
+  id: number; type_id: string; slot_index: number; slots_used: number; cost: number; built_at?: string;
+  /** Where it stands (player buildings on a chosen spot, and real buildings). */
+  lon?: number | null; lat?: number | null; bearing?: number | null;
+  /** Real buildings only. */
+  height_m?: number | null; floor_area_m2?: number | null;
+}
+
+/** A server valuation of a real building on the map. */
+export interface BuildingQuote {
+  parcel_id: number; lon: number; lat: number; area_m2: number; height_m: number; floors: number;
+  floor_area_m2: number; value: number; income_per_tick: number;
+  improvement_id: number | null; owned_parcel_id: number | null; owner_id: string | null; owner_handle: string | null;
+}
 
 export interface TaxLine { id: string; base_expr: string; base: number; rate_bp: number; amount: number }
 
@@ -82,11 +95,23 @@ export const CLASS_LABEL: Record<string, string> = {
 
 export const BUILDING_ICON: Record<string, string> = {
   cottage: '🏡', house: '🏠', terrace: '🏘️', shops: '🏪', apartments: '🏢', office: '🏬', tower: '🏙️', skyscraper: '🌆',
+  real: '🏛️',
+};
+
+export const KIND_ICON: Record<string, string> = {
+  shed: '🛖', house: '🏠', terrace: '🏘️', hall: '🏬', lowrise: '🏢', midrise: '🏢', tower: '🏙️', skyscraper: '🌆',
+};
+
+/** What a real building on the map looks like it is (city3d's guess from its shape). */
+export const KIND_LABEL: Record<string, string> = {
+  shed: 'Outbuilding', house: 'House', terrace: 'Terrace', hall: 'Hall', lowrise: 'Low-rise block',
+  midrise: 'Mid-rise block', tower: 'Tower', skyscraper: 'Skyscraper',
 };
 
 export function reasonLabel(r: string) {
   const map: Record<string, string> = {
     loan: 'Starting loan', loan_repayment: 'Loan repayment', purchase: 'Bought street', build: 'Construction',
+    building_purchase: 'Bought building',
     'income:land': 'Land income', 'income:improvements': 'Building income',
     'tax:property': 'Property tax', 'tax:transfer': 'Transfer tax', 'tax:lvt': 'Land value tax', 'tax:vacancy': 'Vacant land penalty',
   };
@@ -114,6 +139,12 @@ const ERRORS: Record<string, string> = {
   invalid_amount: 'Enter an amount greater than zero.',
   network_error: "Couldn't reach the game server.",
   parcel_not_found: 'That street no longer exists.',
+  building_already_owned: 'Someone has already bought that building.',
+  building_not_on_street: "That building isn't close enough to the street to buy with it.",
+  invalid_building: "That building's map outline looks broken, so it can't be bought.",
+  cannot_demolish_real_building: "Real buildings can't be demolished.",
+  invalid_location: "That spot isn't next to the street.",
+  real_buildings_not_for_sale: "Real buildings can't be bought in this world.",
 };
 
 export function errorText(e: unknown): string {

@@ -6,6 +6,7 @@
 // narrow is a terrace, big and low is a hall, then flats, towers and
 // skyscrapers (window bands, setbacks, rooftop plant, spires).
 // Each building is a single colour (owner colour or neutral) with shading.
+// Player-built buildings use these same models (see buildings3d.ts).
 import * as THREE from 'three';
 import type { LonLat } from './osm';
 
@@ -22,9 +23,14 @@ export interface Footprint {
   minHeight: number;
   /** Stable per-building number for picking style variants. */
   seed: number;
+  /** Model it as this kind instead of guessing from its shape (player buildings). */
+  kind?: Kind;
 }
 
-export const CITY_TINTS: Record<Owner, string> = { none: '#f1eee8', mine: '#3fcf98', other: '#f2837b' };
+/** Bought buildings take the owner's colour; ones merely on an owned street a paler shade of it. */
+export const CITY_TINTS: Record<Owner | 'mineFront' | 'otherFront', string> = {
+  none: '#f1eee8', mine: '#3fcf98', other: '#f2837b', mineFront: '#c9ecd9', otherFront: '#f6d2cd',
+};
 
 // ------------------------------------------------------------------ maths
 
@@ -94,7 +100,8 @@ export function classify(fp: Footprint): { kind: Kind; box: Box2; area: number }
   const box = orientedBox(fp.outer);
   const h = fp.height;
   let kind: Kind;
-  if (area < 30 || h < 3.5) kind = 'shed';
+  if (fp.kind) kind = fp.kind;
+  else if (area < 30 || h < 3.5) kind = 'shed';
   else if (h <= 14) {
     if (area > 1500) kind = 'hall';
     else if (area > 450) kind = 'lowrise';
@@ -195,6 +202,18 @@ const scaleRing = (r: V2[], c: V2, k: number): V2[] => r.map((p) => [c[0] + (p[0
 
 // Shades: walls are full colour, windows and roofs darker.
 const S = { wall: 1, win: 0.86, glass: 0.8, roof: 0.76, flat: 0.9, gable: 0.95, trim: 0.7 };
+
+/** One building's model on its own (e.g. to highlight it). */
+export function buildingGeometry(fp: Footprint, tint = '#ffffff'): THREE.BufferGeometry {
+  const m = new MeshBuilder();
+  m.setTint(tint);
+  buildBuilding(m, fp);
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(m.pos, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(m.col, 3));
+  g.computeVertexNormals();
+  return g;
+}
 
 /** Append one building's model to the mesh builder. */
 export function buildBuilding(m: MeshBuilder, fp: Footprint): Kind {
@@ -317,6 +336,10 @@ export class TileFrame {
   fromLonLat(p: LonLat): V2 {
     return [(mercX(p[0]) - this.mx0) * this.metresPerMerc, (mercY(p[1]) - this.my0) * this.metresPerMerc];
   }
+
+  toLonLat(p: V2): LonLat {
+    return [lonOfMercX(this.mx0 + p[0] / this.metresPerMerc), latOfMercY(this.my0 + p[1] / this.metresPerMerc)];
+  }
 }
 
 // ------------------------------------------------------------- ownership
@@ -357,19 +380,33 @@ const bboxOf = (pts: V2[]) => {
 export interface Ownership {
   mine: LonLat[][];
   other: LonLat[][];
-  /** Footprints of game-built buildings: real buildings here are cleared. */
+  /** Footprints of older game-built buildings that stand on their plot: real buildings there are hidden. */
   cleared: LonLat[][];
+  /** Where real buildings that players bought stand (a point inside or at the middle of each). */
+  bought?: { mine: LonLat[]; other: LonLat[] };
 }
 
-export interface CityStats { buildings: number; mine: number; other: number; cleared: number; kinds: Partial<Record<Kind, number>> }
+export interface CityStats { buildings: number; mine: number; other: number; bought: number; cleared: number; kinds: Partial<Record<Kind, number>> }
+
+/** A building drawn in a tile, and the first triangle of its model (for picking). */
+export interface Drawn { fp: Footprint; tri: number }
 
 /** Build one tile's worth of buildings into a single geometry. */
-export function buildTile(frame: TileFrame, footprints: Footprint[], own: Ownership, frontageM: number): { geometry: THREE.BufferGeometry; stats: CityStats } {
+export function buildTile(frame: TileFrame, footprints: Footprint[], own: Ownership, frontageM: number): { geometry: THREE.BufferGeometry; stats: CityStats; drawn: Drawn[] } {
   const toLines = (ls: LonLat[][]) => ls.map((l) => l.map((p) => frame.fromLonLat(p)))
     .filter((l) => { const b = bboxOf(l); return b.x1 > -100 && b.z1 > -100 && b.x0 < frame.sizeM + 100 && b.z0 < frame.sizeM + 100; });
   const mine = toLines(own.mine), other = toLines(own.other), cleared = toLines(own.cleared);
+  const toPts = (ps: LonLat[] = []) => ps.map((p) => frame.fromLonLat(p))
+    .filter((p) => p[0] > -50 && p[1] > -50 && p[0] < frame.sizeM + 50 && p[1] < frame.sizeM + 50);
+  const boughtMine = toPts(own.bought?.mine), boughtOther = toPts(own.bought?.other);
+  const isBought = (fp: Footprint, pts: V2[]) => {
+    if (!pts.length) return false;
+    const c = centroid(fp.outer);
+    return pts.some((p) => Math.hypot(p[0] - c[0], p[1] - c[1]) < 4 || pointInRing(p, fp.outer));
+  };
   const m = new MeshBuilder();
-  const stats: CityStats = { buildings: 0, mine: 0, other: 0, cleared: 0, kinds: {} };
+  const drawn: Drawn[] = [];
+  const stats: CityStats = { buildings: 0, mine: 0, other: 0, bought: 0, cleared: 0, kinds: {} };
   const near = (fp: Footprint, lines: V2[][], d: number) => {
     const b = bboxOf(fp.outer);
     return lines.some((l) => {
@@ -383,18 +420,22 @@ export function buildTile(frame: TileFrame, footprints: Footprint[], own: Owners
       stats.cleared++;
       continue;
     }
-    const owner: Owner = near(fp, mine, frontageM) ? 'mine' : near(fp, other, frontageM) ? 'other' : 'none';
-    m.setTint(CITY_TINTS[owner]);
+    const bought: Owner = isBought(fp, boughtMine) ? 'mine' : isBought(fp, boughtOther) ? 'other' : 'none';
+    const owner: Owner = bought !== 'none' ? bought
+      : near(fp, mine, frontageM) ? 'mine' : near(fp, other, frontageM) ? 'other' : 'none';
+    m.setTint(CITY_TINTS[bought !== 'none' || owner === 'none' ? owner : owner === 'mine' ? 'mineFront' : 'otherFront']);
+    drawn.push({ fp, tri: m.pos.length / 9 });
     const kind = buildBuilding(m, fp);
     stats.buildings++;
     if (owner !== 'none') stats[owner]++;
+    if (bought !== 'none') stats.bought++;
     stats.kinds[kind] = (stats.kinds[kind] ?? 0) + 1;
   }
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.Float32BufferAttribute(m.pos, 3));
   g.setAttribute('color', new THREE.Float32BufferAttribute(m.col, 3));
   g.computeVertexNormals();
-  return { geometry: g, stats };
+  return { geometry: g, stats, drawn };
 }
 
 /**

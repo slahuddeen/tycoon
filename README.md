@@ -7,8 +7,9 @@ every tick, under economic rules you can swap out.
 Formerly *Land*. The original build spec is in [`docs/original-spec.md`](docs/original-spec.md).
 
 - 🌍 **Any street on Earth.** Streets are read straight from the free OpenStreetMap map tiles your browser already loads: click a road and it's yours to buy, instantly.
-- 🏙️ **A real 3D city.** Every real building is modelled from its OpenStreetMap outline and height: houses get pitched roofs (some with a lower cross-gable and chimneys), terraces get rows of chimneys, towers get window bands, setbacks and spires. Buildings fronting your streets turn green; a rival's turn red.
-- 🏗️ **Build your own.** Put cottages up to 270 m skyscrapers on your plots. The real buildings standing there are cleared to make room.
+- 🏙️ **A real 3D city.** Every real building is modelled from its OpenStreetMap outline and height: houses get pitched roofs (some with a lower cross-gable and chimneys), terraces get rows of chimneys, towers get window bands, setbacks and spires. Buildings fronting your streets get a pale green tint; a rival's a pale red.
+- 🏠 **Buy the real buildings.** Click any building on the map to see what it's worth. Once you own its street, buy it as it stands: it turns your colour and earns rent every tick. Real buildings can't be moved or demolished.
+- 🏗️ **Build your own.** Put cottages up to 240 m skyscrapers on your plots. They're built to real-world sizes in the same style as the city around them, on open ground beside the street: real buildings are never knocked down.
 - 💷 **Honest economics.** Every penny is a row in an append-only ledger. You can see exactly what you earned, what was taxed, and on what base.
 - ⚖️ **Swappable rulesets.** Two worlds run side by side: *Classic* (UK-style property tax) and *Land Tax* (land value tax). Same map, different rules.
 - 🔑 **Simple accounts.** Just a username and password. No email. Players' IP addresses are recorded.
@@ -22,7 +23,8 @@ Once GitHub Pages is switched on (below), the game lives at
 1. Create an account, then pick a world.
 2. Search for a place, or zoom in and **click any named street**.
 3. **Buy** it. The price depends on length, road type, and how busy the area is.
-4. **Build** on its plots. Click an empty plot first to choose the spot.
+4. **Build** on its plots. Click an empty plot first to choose roughly where; the game finds open ground there.
+   Or click a **real building** on your street and buy it.
 5. Every tick (hourly by default) you earn income and pay tax. The top bar shows both separately; 📒 Ledger shows every transaction.
 6. Climb 🏆 Top by net worth. You start with a £50,000 **loan**, not free money, so everyone starts at £0 net worth.
 
@@ -45,6 +47,23 @@ OpenStreetMap type, so the game infers one:
 
 Buildings are detailed from zoom 15 up; further out they're simple blocks.
 A real building counts as "on" a street if it's within 22 m of it.
+
+Buildings players put up use exactly these models, at real-world sizes
+(a house is 8.5 × 9 m, a skyscraper 36 × 32 m and 240 m tall), in one colour:
+the owner's. The game places each one on open ground beside the street,
+clear of real buildings, roads, water and other players' buildings.
+
+**Buying real buildings.** A real building is valued on its floor space
+(footprint × floors, a floor being 3.2 m) using the ruleset's
+`real_buildings.value` formula, by default `floor_area_m2 * density_weight * 3000`
+(£30 per m² of floor space, more in busy areas). Bought buildings are recorded
+as improvements on the street they front, so they earn building income and
+count towards building value and its taxes like anything you build.
+You must own the street first.
+
+**Camera.** Drag with the right mouse button (or Ctrl+drag, or two fingers)
+to orbit and tilt, all the way down to street level. The 🚶 🏙️ 🛰️ buttons
+jump to street level, an angled view, or straight down.
 
 ## Single-player, anywhere in the world
 
@@ -157,7 +176,7 @@ So the architecture changed, but the spec's hard constraints all still hold:
 | `parcel_count_within_500m` density | Counts streets anyone has looked at within the radius, so neighbourhoods appreciate as they get busier. |
 | pg_cron, cadence from the ruleset | A per-minute dispatcher runs only the worlds that are due. Without pg_cron, the same dispatcher runs lazily on player activity. |
 | Basemap must recede; flat buildings | Overridden at your request: real buildings are 3D, but neutral ones are off-white on the grey OpenFreeMap "Positron" basemap, so owned (green/red) streets and buildings are still the only saturated things. |
-| Phase 3 3D | Done with Three.js instead of deck.gl: low-poly procedural buildings, placed along the street by plot, roofs in owner colour, hidden below zoom 14. |
+| Phase 3 3D | Done with Three.js instead of deck.gl: low-poly procedural buildings at real-world sizes, placed on open ground along the street, in the owner's colour, hidden below zoom 14. |
 | Tests (money, concurrency, authorisation, ruleset isolation, data) | `tests/db.test.ts`: money sums to zero; only loan and income ever pay players; concurrent buy gives exactly one winner; concurrent builds can't overfill; ownership and cross-world checks; `anon` can't touch tables; uk-baseline and lvt give different wealth outcomes under identical play. |
 
 Additions beyond the spec: choose-your-plot building, a live activity feed,

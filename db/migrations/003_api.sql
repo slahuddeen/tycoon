@@ -83,7 +83,9 @@ BEGIN
     'c_lon', p.c_lon, 'c_lat', p.c_lat, 'geom', p.geom,
     'improvements', COALESCE((SELECT jsonb_agg(jsonb_build_object(
         'id', i.id, 'type_id', i.type_id, 'slot_index', i.slot_index,
-        'slots_used', i.slots_used, 'cost', i.cost, 'built_at', i.built_at) ORDER BY i.slot_index)
+        'slots_used', i.slots_used, 'cost', i.cost, 'built_at', i.built_at,
+        'lon', i.lon, 'lat', i.lat, 'bearing', i.bearing,
+        'height_m', i.height_m, 'floor_area_m2', i.floor_area_m2) ORDER BY i.slot_index, i.id)
       FROM tycoon.improvements i WHERE i.parcel_id = p.id), '[]'::JSONB));
   IF NOT p_detail THEN RETURN j; END IF;
 
@@ -252,7 +254,7 @@ CREATE OR REPLACE FUNCTION public.tycoon_building_types(p JSONB)
 RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = tycoon, extensions, public AS $$
 BEGIN
   RETURN COALESCE((SELECT jsonb_agg(to_jsonb(b) ORDER BY b.sort_order, b.cost)
-                     FROM tycoon.building_types b), '[]'::JSONB);
+                     FROM tycoon.building_types b WHERE b.buildable), '[]'::JSONB);
 END $$;
 
 CREATE OR REPLACE FUNCTION public.tycoon_join(p JSONB)
@@ -354,7 +356,28 @@ CREATE OR REPLACE FUNCTION public.tycoon_build(p JSONB)
 RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = tycoon, extensions, public AS $$
 DECLARE v_pl UUID := tycoon.auth_player(p); v_bal BIGINT;
 BEGIN
-  v_bal := tycoon.build_improvement(v_pl, (p ->> 'parcel_id')::BIGINT, p ->> 'type_id', (p ->> 'slot')::INT);
+  v_bal := tycoon.build_improvement(v_pl, (p ->> 'parcel_id')::BIGINT, p ->> 'type_id', (p ->> 'slot')::INT,
+                                    (p ->> 'lon')::FLOAT8, (p ->> 'lat')::FLOAT8, (p ->> 'bearing')::FLOAT8);
+  RETURN jsonb_build_object('balance', v_bal, 'parcel', tycoon.parcel_json((p ->> 'parcel_id')::BIGINT, true));
+END $$;
+
+-- What a real building is worth, and whether someone already owns it.
+CREATE OR REPLACE FUNCTION public.tycoon_building_quote(p JSONB)
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = tycoon, extensions, public AS $$
+BEGIN
+  PERFORM tycoon.auth_account(p);
+  IF NOT EXISTS (SELECT 1 FROM tycoon.parcels WHERE id = (p ->> 'parcel_id')::BIGINT
+                                              AND world_id = (p ->> 'world_id')::UUID) THEN
+    RAISE EXCEPTION 'parcel_not_found';
+  END IF;
+  RETURN tycoon.real_building_quote((p ->> 'parcel_id')::BIGINT, p -> 'outline', (p ->> 'height')::FLOAT8);
+END $$;
+
+CREATE OR REPLACE FUNCTION public.tycoon_buy_building(p JSONB)
+RETURNS JSONB LANGUAGE plpgsql SECURITY DEFINER SET search_path = tycoon, extensions, public AS $$
+DECLARE v_pl UUID := tycoon.auth_player(p); v_bal BIGINT;
+BEGIN
+  v_bal := tycoon.buy_real_building(v_pl, (p ->> 'parcel_id')::BIGINT, p -> 'outline', (p ->> 'height')::FLOAT8);
   RETURN jsonb_build_object('balance', v_bal, 'parcel', tycoon.parcel_json((p ->> 'parcel_id')::BIGINT, true));
 END $$;
 

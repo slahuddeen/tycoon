@@ -107,3 +107,23 @@ INSERT INTO tycoon.building_types (id, name, description, cost, slots_used, yiel
   ('tower',      'Tower',            'A landmark high-rise.',                  20000000,  6, 12000, 7),
   ('skyscraper', 'Skyscraper',       'Owns the skyline.',                      60000000, 10, 12500, 8)
 ON CONFLICT (id) DO NOTHING;
+
+-- Real buildings bought off the map. Their cost is a valuation, not a
+-- fixed price (see real_buildings in the rulesets), and they take no plots.
+INSERT INTO tycoon.building_types (id, name, description, cost, slots_used, yield_bp, sort_order, buildable) VALUES
+  ('real', 'Real building', 'A real building from the map, bought as it stands.', 1, 1, 10000, 100, false)
+ON CONFLICT (id) DO NOTHING;
+
+-- How real buildings are valued. Added to rulesets made before real
+-- buildings could be bought; your own edits are kept.
+UPDATE tycoon.rulesets SET config = config || $json$
+ {
+   "real_buildings": {
+     "value": "floor_area_m2 * density_weight * 3000",
+     "floor_height_m": 3.2,
+     "max_floors": 150,
+     "max_frontage_m": 60
+   }
+ }
+ $json$::jsonb
+WHERE NOT config ? 'real_buildings';
