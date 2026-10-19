@@ -69,15 +69,10 @@ export async function worldId(db: Db, slug: string): Promise<string> {
   return (await db.q(`SELECT id FROM tycoon.worlds WHERE slug = $1`, [slug]))[0].id;
 }
 
-let wayCounter = 1000;
 /** A fake straight street of roughly `metres` length starting at lon/lat. */
 export function fakeStreet(lon: number, lat: number, metres: number, highway = 'residential') {
-  const id = ++wayCounter;
   const dLon = metres / (111320 * Math.cos((lat * Math.PI) / 180));
-  return {
-    anchor_way: id,
-    ways: [{ id, highway, coords: [[lon, lat], [lon + dLon / 2, lat], [lon + dLon, lat]] }],
-  };
+  return { highway, lines: [[[lon, lat], [lon + dLon / 2, lat], [lon + dLon, lat]]] };
 }
 
 export async function newPlayer(db: Db, world: string, username: string) {

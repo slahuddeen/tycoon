@@ -6,8 +6,9 @@ every tick, under economic rules you can swap out.
 
 Formerly *Land*. The original build spec is in [`docs/original-spec.md`](docs/original-spec.md).
 
-- 🌍 **Any street on Earth.** Streets come live from OpenStreetMap, so there's nothing to download or import.
-- 🏙️ **3D buildings.** Cottages up to 270 m skyscrapers grow out of the street when you build. Your roofs are green, everyone else's are red.
+- 🌍 **Any street on Earth.** Streets are read straight from the free OpenStreetMap map tiles your browser already loads: click a road and it's yours to buy, instantly.
+- 🏙️ **A real 3D city.** Every real building is modelled from its OpenStreetMap outline and height: houses get pitched roofs (some with a lower cross-gable and chimneys), terraces get rows of chimneys, towers get window bands, setbacks and spires. Buildings fronting your streets turn green; a rival's turn red.
+- 🏗️ **Build your own.** Put cottages up to 270 m skyscrapers on your plots. The real buildings standing there are cleared to make room.
 - 💷 **Honest economics.** Every penny is a row in an append-only ledger. You can see exactly what you earned, what was taxed, and on what base.
 - ⚖️ **Swappable rulesets.** Two worlds run side by side: *Classic* (UK-style property tax) and *Land Tax* (land value tax). Same map, different rules.
 - 🔑 **Simple accounts.** Just a username and password. No email. Players' IP addresses are recorded.
@@ -26,6 +27,24 @@ Once GitHub Pages is switched on (below), the game lives at
 6. Climb 🏆 Top by net worth. You start with a £50,000 **loan**, not free money, so everyone starts at £0 net worth.
 
 Motorways, service roads and footpaths can't be bought.
+
+## About the 3D city
+
+The free map tiles include every building's outline and height, but not its
+OpenStreetMap type, so the game infers one:
+
+| Looks like | Becomes |
+|---|---|
+| tiny or under 3.5 m | shed (flat box) |
+| up to 14 m, small | house: gable or hipped roof, sometimes a lower cross-gable, chimney |
+| up to 14 m, long and narrow | terrace: one long roof with a row of chimneys |
+| up to 14 m, large | low-rise flats or a hall, with rooftop plant |
+| 14–40 m | mid-rise: window bands, parapet, plant room |
+| 40–120 m | tower: glass bands, setback crown |
+| over 120 m | skyscraper: three tiers and a spire |
+
+Buildings are detailed from zoom 15 up; further out they're simple blocks.
+A real building counts as "on" a street if it's within 22 m of it.
 
 ## Single-player, anywhere in the world
 
@@ -110,7 +129,8 @@ supabase/setup.sql  generated; paste into Supabase (also what offline mode runs)
 web/src/
   main.ts           app controller: screens, game loop, actions
   map.ts            MapLibre map, ownership-coloured streets, click handling
-  buildings3d.ts    procedural low-poly 3D buildings (Three.js custom layer)
+  buildings3d.ts    Three.js layer: game-built buildings + the real city
+  city3d.ts         real buildings -> classified low-poly models (roofs, bands, setbacks)
   osm.ts            OpenStreetMap lookups + merging a street's ways
   backend.ts        Supabase (online) or PGlite (offline) – same SQL either way
   ui.ts, style.css  panels, HUD, modals
@@ -133,10 +153,10 @@ So the architecture changed, but the spec's hard constraints all still hold:
 | Client never writes economic tables | Tables live in a schema the API can't see; clients can only `EXECUTE` the `public.tycoon_*` functions (`SECURITY DEFINER`). RLS is on for every table. Tested with the `anon` role. |
 | No signup grant, no login grant | Starting capital is a repayable loan in the ledger. Player-to-player transfer doesn't exist. |
 | Fastify API + sessions | Replaced by SQL functions called over Supabase's REST endpoint. Sessions are random tokens. Passwords are bcrypt (pgcrypto), since Argon2id isn't available in Postgres. |
-| PostGIS + osm2pgsql London import | Replaced by on-demand lookups against the free Overpass API, for any street worldwide. Same merge rule: connected, same-named ways become one parcel. A way can only ever belong to one parcel per world. Geometry is JSON, so no PostGIS is needed (that's also what lets the identical SQL run in the browser). |
+| PostGIS + osm2pgsql London import | Replaced by reading streets from the OpenMapTiles vector tiles the map already loads, for any street worldwide. Same merge rule: connected, same-named pieces become one parcel; the server treats the same name within ~150 m as the same street. Geometry is JSON, so no PostGIS is needed (that's also what lets the identical SQL run in the browser). |
 | `parcel_count_within_500m` density | Counts streets anyone has looked at within the radius, so neighbourhoods appreciate as they get busier. |
 | pg_cron, cadence from the ruleset | A per-minute dispatcher runs only the worlds that are due. Without pg_cron, the same dispatcher runs lazily on player activity. |
-| Basemap must recede; flat buildings | OpenFreeMap "Positron" (grey, no API key) with OSM buildings flattened; player streets and buildings are the only saturated things. |
+| Basemap must recede; flat buildings | Overridden at your request: real buildings are 3D, but neutral ones are off-white on the grey OpenFreeMap "Positron" basemap, so owned (green/red) streets and buildings are still the only saturated things. |
 | Phase 3 3D | Done with Three.js instead of deck.gl: low-poly procedural buildings, placed along the street by plot, roofs in owner colour, hidden below zoom 14. |
 | Tests (money, concurrency, authorisation, ruleset isolation, data) | `tests/db.test.ts`: money sums to zero; only loan and income ever pay players; concurrent buy gives exactly one winner; concurrent builds can't overfill; ownership and cross-world checks; `anon` can't touch tables; uk-baseline and lvt give different wealth outcomes under identical play. |
 
@@ -151,6 +171,6 @@ A foreclosure rule would be the natural next step.
 
 ## Credits & licences
 
-- Map data © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors (ODbL). Street geometry via the Overpass API; search via Nominatim.
+- Map data © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors (ODbL). Search via Nominatim.
 - Map tiles by [OpenFreeMap](https://openfreemap.org); rendering by [MapLibre GL JS](https://maplibre.org); 3D by [Three.js](https://threejs.org).
 - In-browser Postgres by [PGlite](https://pglite.dev).

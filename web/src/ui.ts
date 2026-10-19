@@ -294,7 +294,7 @@ export const HELP = `
   </ol>
   <p class="fine">Each world has its own economic rules: try the same strategy in <i>Classic</i> and <i>Land Tax</i> and compare.
   Streets are real OpenStreetMap roads. Motorways, service roads and footpaths can't be bought.</p>
-  <p class="fine">Map © OpenStreetMap contributors · tiles by OpenFreeMap · geocoding by Nominatim · street data via Overpass API.</p>`;
+  <p class="fine">Map © OpenStreetMap contributors · tiles by OpenFreeMap · geocoding by Nominatim.</p>`;
 
 export function feed(events: any[]) {
   const verb: Record<string, string> = { purchase: 'bought', build: 'built on', demolish: 'demolished on', release: 'gave up', joined: 'joined the game', lease_expired: 'lost the lease on' };

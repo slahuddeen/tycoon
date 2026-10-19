@@ -1,84 +1,94 @@
 // End-to-end smoke test in headless Chromium against the built site
-// (`npm run build` first). External map services are replaced by a fake
-// street grid so it runs offline:
+// (`npm run build` first). The map service is replaced by a fake city served
+// as real vector tiles in the same OpenMapTiles format OpenFreeMap uses
+// (roads, street names, buildings with heights), so it runs offline:
 //   node scripts/e2e-smoke.mjs [outDir]
 // Set E2E_REST=http://localhost:3000 to play in online mode against a local
 // PostgREST serving the game database (stands in for Supabase).
-// Plays a full round in the offline sandbox: register, pick a world, click a
-// street, buy it, build on it, run a tick, open the ledger. Saves screenshots.
+// Plays a full round: register, pick a world, click a street, buy it, build
+// on it, run ticks, a rival player, ledger, search, mobile. Saves screenshots.
 import { chromium } from 'playwright-core';
 import { spawn } from 'node:child_process';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import geojsonvt from 'geojson-vt';
+import vtpbf from 'vt-pbf';
 
 const OUT = process.argv[2] ?? 'e2e-shots';
 mkdirSync(OUT, { recursive: true });
 const PORT = 4179;
 const CENTER = [-0.13, 51.51];
 
-// ------------------------------------------------------------ fake streets
+// -------------------------------------------------------------- fake city
 const dLat = 0.0018, dLon = 0.0029;                       // ~200m blocks
-const ways = [];
-let nodeId = 1, wayId = 100;
+const mPerLat = 111320, mPerLon = 111320 * Math.cos((CENTER[1] * Math.PI) / 180);
+const roads = [];        // transportation + transportation_name features
 const H = ['Alpha Street', 'Bridge Road', 'Crown Lane', 'Duke Street', 'Elm Row'];
 const V = ['Kings Avenue', 'Market Street', 'Old Road', 'Park Lane', 'Queens Walk'];
-function addStreet(name, highway, pts) {
-  // Split every street into several OSM ways that share junction nodes.
-  const nodes = pts.map(() => nodeId++);
+function addStreet(name, cls, pts) {
+  // Each street arrives in several pieces, like real tiles split at junctions.
   for (let i = 0; i < pts.length - 1; i += 2) {
-    const slice = pts.slice(i, Math.min(i + 3, pts.length));
-    ways.push({ type: 'way', id: wayId++, tags: { name, highway }, nodes: nodes.slice(i, i + slice.length),
-      geometry: slice.map(([lon, lat]) => ({ lon, lat })) });
+    roads.push({ type: 'Feature', properties: { name, class: cls },
+      geometry: { type: 'LineString', coordinates: pts.slice(i, Math.min(i + 3, pts.length)) } });
   }
 }
 for (let r = 0; r < H.length; r++) {
   const lat = CENTER[1] + (r - 2) * dLat;
-  addStreet(H[r], r === 2 ? 'secondary' : 'residential', Array.from({ length: 7 }, (_, i) => [CENTER[0] + (i - 3) * dLon, lat]));
+  addStreet(H[r], r === 2 ? 'secondary' : 'minor', Array.from({ length: 7 }, (_, i) => [CENTER[0] + (i - 3) * dLon, lat]));
 }
 for (let c = 0; c < V.length; c++) {
   const lon = CENTER[0] + (c - 2) * dLon;
   addStreet(V[c], c === 0 ? 'primary' : 'tertiary', Array.from({ length: 7 }, (_, i) => [lon, CENTER[1] + (i - 3) * dLat]));
 }
+roads.push({ type: 'Feature', properties: { name: 'Ring Motorway', class: 'motorway' },
+  geometry: { type: 'LineString', coordinates: [[CENTER[0] - 4 * dLon, CENTER[1] - 3.2 * dLat], [CENTER[0] + 4 * dLon, CENTER[1] - 3.2 * dLat]] } });
 
-const rad = (d) => (d * Math.PI) / 180;
-function segDist([px, py], [ax, ay], [bx, by]) {
-  const k = Math.cos(rad(py));
-  const x1 = (ax - px) * k, y1 = ay - py, x2 = (bx - px) * k, y2 = by - py;
-  const dx = x2 - x1, dy = y2 - y1, l2 = dx * dx + dy * dy;
-  const t = l2 ? Math.max(0, Math.min(1, -(x1 * dx + y1 * dy) / l2)) : 0;
-  return Math.hypot(x1 + t * dx, y1 + t * dy) * 111320;
+// Buildings: rows of varied heights fronting every street, plus some towers.
+const buildings = [];
+let n = 0;
+const rect = (lon0, lat0, wM, hM) => [[[lon0, lat0], [lon0 + wM / mPerLon, lat0], [lon0 + wM / mPerLon, lat0 + hM / mPerLat], [lon0, lat0 + hM / mPerLat], [lon0, lat0]]];
+for (let r = -3; r < 3; r++) for (let c = -3; c < 3; c++) {
+  const x0 = CENTER[0] + c * dLon, y0 = CENTER[1] + r * dLat;
+  const residential = c < 0;   // western blocks: rows of houses; eastern: offices and towers
+  if (residential) {
+    for (let k = 0; k < 13; k++) {
+      const lon = x0 + (10 + k * 14) / mPerLon;
+      const h = () => 5 + ((++n * 13) % 5);
+      buildings.push({ type: 'Feature', properties: { render_height: h(), render_min_height: 0 }, geometry: { type: 'Polygon', coordinates: rect(lon, y0 + 9 / mPerLat, 10, 12) } });
+      buildings.push({ type: 'Feature', properties: { render_height: h(), render_min_height: 0 }, geometry: { type: 'Polygon', coordinates: rect(lon, y0 + dLat - 21 / mPerLat, 10, 12) } });
+    }
+    buildings.push({ type: 'Feature', properties: { render_height: 8, render_min_height: 0 }, geometry: { type: 'Polygon', coordinates: rect(x0 + 30 / mPerLon, y0 + 60 / mPerLat, 60, 8) } });
+  } else {
+    for (let k = 0; k < 7; k++) {
+      const lon = x0 + (14 + k * 25) / mPerLon;
+      const h = () => (++n % 11 === 0 ? 110 + (n % 5) * 25 : 9 + ((n * 37) % 45));
+      buildings.push({ type: 'Feature', properties: { render_height: h(), render_min_height: 0 }, geometry: { type: 'Polygon', coordinates: rect(lon, y0 + 8 / mPerLat, 21, 16) } });
+      buildings.push({ type: 'Feature', properties: { render_height: h(), render_min_height: 0 }, geometry: { type: 'Polygon', coordinates: rect(lon, y0 + dLat - 24 / mPerLat, 21, 16) } });
+    }
+  }
 }
-const wayDist = (p, w) => Math.min(...w.geometry.slice(1).map((g, i) => segDist(p, [w.geometry[i].lon, w.geometry[i].lat], [g.lon, g.lat])));
-
-function overpass(q) {
-  const id = q.match(/way\((\d+)\)/);
-  if (id) return ways.filter((w) => w.id === Number(id[1]));
-  const name = q.match(/\["name"="([^"]+)"\]/);
-  if (name) return ways.filter((w) => w.tags.name === name[1]);
-  const m = q.match(/around:(\d+),([-\d.]+),([-\d.]+)/);
-  const p = [Number(m[3]), Number(m[2])];
-  return ways.filter((w) => wayDist(p, w) <= Number(m[1]));
-}
-
-// Building blocks between streets, so the fake basemap looks like a city.
-const blocks = [];
-for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++) {
-  const x0 = CENTER[0] + (c - 2) * dLon + 0.0004, y0 = CENTER[1] + (r - 2) * dLat + 0.0003;
-  const x1 = x0 + dLon - 0.0008, y1 = y0 + dLat - 0.0006;
-  blocks.push({ type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [[[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]] } });
+const indexes = {
+  transportation: new geojsonvt({ type: 'FeatureCollection', features: roads.map((f) => ({ ...f, properties: { class: f.properties.class } })) }, { maxZoom: 14, indexMaxZoom: 14 }),
+  transportation_name: new geojsonvt({ type: 'FeatureCollection', features: roads }, { maxZoom: 14, indexMaxZoom: 14 }),
+  building: new geojsonvt({ type: 'FeatureCollection', features: buildings }, { maxZoom: 14, indexMaxZoom: 14 }),
+};
+function tile(z, x, y) {
+  const layers = {};
+  for (const [name, idx] of Object.entries(indexes)) {
+    const t = idx.getTile(z, x, y);
+    if (t) layers[name] = t;
+  }
+  return Buffer.from(vtpbf.fromGeojsonVt(layers, { version: 2 }));
 }
 const style = {
   version: 8,
   glyphs: 'https://tiles.openfreemap.org/fonts/{fontstack}/{range}.pbf',
-  sources: {
-    roads: { type: 'geojson', data: { type: 'FeatureCollection', features: ways.map((w) => ({ type: 'Feature', properties: { name: w.tags.name }, geometry: { type: 'LineString', coordinates: w.geometry.map((g) => [g.lon, g.lat]) } })) } },
-    blocks: { type: 'geojson', data: { type: 'FeatureCollection', features: blocks } },
-  },
+  sources: { openmaptiles: { type: 'vector', tiles: ['https://tiles.openfreemap.org/planet/{z}/{x}/{y}.pbf'], maxzoom: 14 } },
   layers: [
     { id: 'bg', type: 'background', paint: { 'background-color': '#f2f1ee' } },
-    { id: 'blocks', type: 'fill', source: 'blocks', paint: { 'fill-color': '#e6e6e3', 'fill-outline-color': '#d6d6d2' } },
-    { id: 'roads-case', type: 'line', source: 'roads', paint: { 'line-color': '#d8d8d4', 'line-width': 14 } },
-    { id: 'roads', type: 'line', source: 'roads', paint: { 'line-color': '#ffffff', 'line-width': 11 } },
+    { id: 'building', type: 'fill', source: 'openmaptiles', 'source-layer': 'building', paint: { 'fill-color': '#e6e6e3' } },
+    { id: 'road-case', type: 'line', source: 'openmaptiles', 'source-layer': 'transportation', paint: { 'line-color': '#d8d8d4', 'line-width': 14 } },
+    { id: 'road', type: 'line', source: 'openmaptiles', 'source-layer': 'transportation', paint: { 'line-color': '#ffffff', 'line-width': 11 } },
   ],
 };
 
@@ -113,13 +123,15 @@ try {
   await page.route('https://tiles.openfreemap.org/styles/**', (r) => r.fulfill({ json: style }));
   await page.route('https://tiles.openfreemap.org/fonts/**', (r) => r.fulfill({ status: 200, body: Buffer.alloc(0), contentType: 'application/x-protobuf' }));
   await page.route('https://fonts.googleapis.com/**', (r) => r.fulfill({ status: 200, body: '', contentType: 'text/css' }));
-  await page.route('**/api/interpreter', async (r) => {
-    const q = decodeURIComponent(r.request().postData().replace(/^data=/, ''));
-    r.fulfill({ json: { elements: overpass(q) } });
+  await page.route('https://tiles.openfreemap.org/planet/**', (r) => {
+    const [z, x, y] = new URL(r.request().url()).pathname.match(/(\d+)\/(\d+)\/(\d+)\.pbf$/).slice(1).map(Number);
+    r.fulfill({ body: tile(z, x, y), contentType: 'application/x-protobuf' });
   });
+  let overpassCalls = 0;
+  await page.route('**/api/interpreter', (r) => { overpassCalls++; r.abort(); });
   await page.route('https://nominatim.openstreetmap.org/reverse**', (r) => r.fulfill({ json: { address: { suburb: 'Soho', city: 'London' } } }));
   await page.route('https://nominatim.openstreetmap.org/search**', (r) => r.fulfill({ json: [
-    { display_name: 'Market Street, Soho, London', lat: String(CENTER[1]), lon: String(CENTER[0]), osm_type: 'way', osm_id: ways.find((w) => w.tags.name === 'Market Street').id, category: 'highway' },
+    { display_name: 'Market Street, Soho, London', name: 'Market Street', lat: String(CENTER[1] + 0.5 * dLat), lon: String(CENTER[0] - dLon), osm_type: 'way', osm_id: 1, category: 'highway' },
   ] }));
 
   const shot = (n) => page.screenshot({ path: join(OUT, n) });
@@ -210,6 +222,15 @@ try {
   const visible = await page.evaluate(() => window.tycoon.gm.buildings['live'].size);
   step(`3D buildings in scene: ${visible}`);
   if (visible < 5) throw new Error('expected 3D buildings in the scene');
+  const city = await page.evaluate(() => window.tycoon.gm.cityStats());
+  step(`real buildings modelled: ${city.buildings} (${city.mine} yours, ${city.other} rival's, ${city.cleared} cleared for construction) kinds=${JSON.stringify(city.kinds)}`);
+  if (city.buildings < 20 || city.mine < 1 || city.other < 1) throw new Error('expected coloured real 3D buildings');
+  if (!city.kinds.house || !(city.kinds.tower || city.kinds.skyscraper)) throw new Error('expected houses and towers');
+  // Close-up of the rooftops.
+  await page.evaluate((c) => window.tycoon.gm.map.jumpTo({ center: [c[0] - 0.0035, c[1] + 0.0012], zoom: 18, pitch: 58, bearing: 30 }), CENTER);
+  await page.waitForTimeout(2500);
+  await shot('5b-rooftops.png');
+  if (overpassCalls) throw new Error(`street lookup should not call Overpass (${overpassCalls} calls)`);
 
   await page.click('[data-action=open-ledger]');
   await page.waitForSelector('.ledger');
@@ -234,6 +255,21 @@ try {
 } catch (e) {
   ok = false;
   console.error('FAILED:', e);
+  try {
+    const pg = browser.contexts()[0].pages()[0];
+    await pg.screenshot({ path: join(OUT, 'fail.png') });
+    console.error('debug:', JSON.stringify(await pg.evaluate((c) => {
+      const gm = window.tycoon.gm;
+      const src = gm.tiles;
+      const feats = src ? gm.map.querySourceFeatures(src, { sourceLayer: 'transportation_name' }) : [];
+      const roadsDrawn = gm.map.querySourceFeatures(src, { sourceLayer: 'transportation' }).length;
+      const bld = gm.map.querySourceFeatures(src, { sourceLayer: 'building' }).length;
+      return { roadsDrawn, bld, src, zoom: gm.map.getZoom(), feats: feats.length, sample: feats.slice(0, 2).map((f) => f.properties),
+        cand: gm.findStreetAt([c[0] + 0.0012, c[1] + 0.0018])?.name ?? null,
+        toasts: [...document.querySelectorAll('.toast')].map((t) => t.textContent),
+        panel: document.querySelector('#panel')?.textContent?.slice(0, 200) };
+    }, CENTER)));
+  } catch (err) { console.error('debug failed', err); }
 } finally {
   if (errors.length) {
     console.error('Page errors:\n' + errors.join('\n'));

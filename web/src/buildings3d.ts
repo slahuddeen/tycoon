@@ -14,6 +14,8 @@ export const COLORS = {
 };
 
 export const MIN_3D_ZOOM = 14;
+/** Zoom from which real buildings are drawn as detailed models. */
+export const CITY_MIN_ZOOM = 15;
 
 export interface BuildingSpec {
   key: string;          // improvement id
@@ -198,6 +200,24 @@ function model(type: string, slotWidth: number): Model {
   return m;
 }
 
+/** Footprint width limits [max, min] in metres, matching buildModel. */
+const WIDTH: Record<string, [number, number]> = {
+  cottage: [13, 8], house: [15, 8], terrace: [40, 16], shops: [36, 16], apartments: [34, 16],
+  office: [36, 18], tower: [34, 22], skyscraper: [46, 26],
+};
+
+/** Ground rectangle a player building covers, as a GeoJSON ring (with a margin). */
+export function footprint(spec: BuildingSpec, margin = 3): LonLat[] {
+  const [max, min] = WIDTH[spec.typeId] ?? [20, 8];
+  const bucket = Math.round(spec.width / 4) * 4;
+  const halfW = Math.max(min, Math.min(max, bucket * 0.85)) / 2 + margin;
+  const halfD = (DEPTH[spec.typeId] ?? 14) / 2 + margin;
+  const along = spec.bearing, across = spec.bearing + 90;
+  const c = (a: number, b: number) => offset(offset(spec.lonLat, along, a), across, b);
+  const ring = [c(-halfW, -halfD), c(halfW, -halfD), c(halfW, halfD), c(-halfW, halfD)];
+  return [...ring, ring[0]];
+}
+
 /** Depth of a building's footprint (for setting it back from the street). */
 const DEPTH: Record<string, number> = {
   cottage: 10, house: 12, terrace: 12, shops: 14, apartments: 18, office: 24, tower: 30, skyscraper: 40,
@@ -258,6 +278,9 @@ export class BuildingLayer implements CustomLayerInterface {
   private originMerc = MercatorCoordinate.fromLngLat([0, 0], 0);
   private live = new Map<string, Live>();
   private bodyMat = new THREE.MeshLambertMaterial({ vertexColors: true });
+  private cityMat = new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide });
+  private city = new Map<string, { mesh: THREE.Mesh; anchor: LonLat }>();
+  private cityGroup = new THREE.Group();
   private accentMats = {
     mine: new THREE.MeshLambertMaterial({ color: COLORS.mine }),
     other: new THREE.MeshLambertMaterial({ color: COLORS.other }),
@@ -270,6 +293,7 @@ export class BuildingLayer implements CustomLayerInterface {
     this.map = map;
     this.renderer = new THREE.WebGLRenderer({ canvas: map.getCanvas(), context: gl as WebGL2RenderingContext, antialias: true });
     this.renderer.autoClear = false;
+    this.scene.add(this.cityGroup);
     this.scene.add(new THREE.HemisphereLight(0xffffff, 0x8899aa, 2.2));
     const sun = new THREE.DirectionalLight(0xffffff, 1.6);
     sun.position.set(-60, 120, -40);
@@ -289,6 +313,44 @@ export class BuildingLayer implements CustomLayerInterface {
     this.origin = p;
     this.originMerc = MercatorCoordinate.fromLngLat(p, 0);
     for (const l of this.live.values()) l.group.position.copy(this.toScene(l.spec.lonLat));
+    for (const c of this.city.values()) c.mesh.position.copy(this.toScene(c.anchor));
+  }
+
+  private ensureOrigin() {
+    const c = this.map.getCenter();
+    if (Math.abs(c.lat - this.origin[1]) > 0.2 || Math.abs(c.lng - this.origin[0]) > 0.3) {
+      this.resetOrigin([c.lng, c.lat]);
+    }
+  }
+
+  // ------------------------------------------------ real city, per map tile
+
+  hasCityTile(key: string) {
+    return this.city.has(key);
+  }
+
+  cityTileKeys() {
+    return [...this.city.keys()];
+  }
+
+  /** Add or replace one map tile's worth of real buildings (null removes it). */
+  setCityTile(key: string, anchor: LonLat, geometry: THREE.BufferGeometry | null) {
+    if (!this.map) return;
+    this.ensureOrigin();
+    const old = this.city.get(key);
+    if (old) {
+      this.cityGroup.remove(old.mesh);
+      old.mesh.geometry.dispose();
+      this.city.delete(key);
+    }
+    if (geometry) {
+      const mesh = new THREE.Mesh(geometry, this.cityMat);
+      mesh.position.copy(this.toScene(anchor));
+      mesh.matrixAutoUpdate = true;
+      this.city.set(key, { mesh, anchor });
+      this.cityGroup.add(mesh);
+    }
+    this.map.triggerRepaint();
   }
 
   setSelected(parcelId: number | null) {
@@ -307,10 +369,7 @@ export class BuildingLayer implements CustomLayerInterface {
   /** Replace the set of visible buildings; new ones grow out of the ground. */
   setBuildings(specs: BuildingSpec[], animateNew = true) {
     if (!this.map) return;
-    const c = this.map.getCenter();
-    if (Math.abs(c.lat - this.origin[1]) > 0.2 || Math.abs(c.lng - this.origin[0]) > 0.3) {
-      this.resetOrigin([c.lng, c.lat]);
-    }
+    this.ensureOrigin();
     const seen = new Set<string>();
     const now = performance.now();
     for (const spec of specs) {
@@ -362,7 +421,9 @@ export class BuildingLayer implements CustomLayerInterface {
   }
 
   render(_gl: WebGLRenderingContext | WebGL2RenderingContext, args: CustomRenderMethodInput) {
-    if (!this.live.size || this.map.getZoom() < MIN_3D_ZOOM) return;
+    const zoom = this.map.getZoom();
+    this.cityGroup.visible = zoom >= CITY_MIN_ZOOM;
+    if ((!this.live.size && !(this.city.size && this.cityGroup.visible)) || zoom < MIN_3D_ZOOM) return;
     const now = performance.now();
     let anim = false;
     for (const l of this.live.values()) {

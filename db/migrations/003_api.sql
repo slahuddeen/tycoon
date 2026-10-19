@@ -334,7 +334,7 @@ DECLARE v_id BIGINT;
 BEGIN
   PERFORM tycoon.auth_account(p);
   v_id := tycoon.claim_parcel((p ->> 'world_id')::UUID, p ->> 'name', p ->> 'suburb',
-                              (p ->> 'anchor_way')::BIGINT, p -> 'ways');
+                              p ->> 'highway', p -> 'lines');
   RETURN tycoon.parcel_json(v_id, true);
 END $$;
 

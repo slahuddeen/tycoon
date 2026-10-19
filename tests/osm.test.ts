@@ -1,35 +1,49 @@
 import { describe, expect, it } from 'vitest';
-import { alongLines, distM, lineLengthM, mergeLines, OsmWay, streetComponent, toCandidate } from '../web/src/osm';
+import { alongLines, distM, lineLengthM, mergeLines, omtClass, streetFromTiles, TileRoad } from '../web/src/osm';
 
-const way = (id: number, name: string, nodes: number[], coords: [number, number][], highway = 'residential'): OsmWay => ({
-  id, nodes, tags: { name, highway }, geometry: coords.map(([lon, lat]) => ({ lon, lat })),
-});
-
-describe('street merging', () => {
-  // Oxford Street split into 3 ways at junctions, plus a disjoint
-  // same-named street 5km away, plus a parallel dual carriageway.
-  const ways = [
-    way(1, 'High St', [1, 2, 3], [[0, 51], [0.001, 51], [0.002, 51]]),
-    way(2, 'High St', [3, 4], [[0.002, 51], [0.003, 51]]),
-    way(3, 'High St', [4, 5, 6], [[0.003, 51], [0.004, 51], [0.005, 51]]),
-    way(4, 'High St', [100, 101], [[0.07, 51], [0.071, 51]]),
-    way(5, 'High St', [200, 201], [[0.0049, 51.0002], [0.0061, 51.0002]]),
+describe('streets from map tiles', () => {
+  const road = (name: string, cls: string, line: [number, number][], subclass?: string): TileRoad => ({ name, cls, subclass, lines: [line] });
+  // High St split into pieces at junctions/tile edges, one piece repeated by an
+  // overlapping tile, a disjoint High St 5km away, a crossing road, a footpath.
+  const roads = [
+    road('High St', 'minor', [[0, 51], [0.001, 51], [0.002, 51]]),
+    road('High St', 'minor', [[0.002, 51], [0.003, 51]]),
+    road('High St', 'minor', [[0.002, 51], [0.003, 51]]),
+    road('High St', 'tertiary', [[0.003, 51], [0.004, 51], [0.009, 51]]),
+    road('High St', 'minor', [[0.07, 51], [0.071, 51]]),
+    road('Cross Rd', 'secondary', [[0.0015, 50.999], [0.0015, 51.001]]),
+    road('Garden Path', 'path', [[0.0005, 51.0001], [0.0009, 51.0001]], 'footway'),
   ];
 
-  it('merges connected ways into one street and keeps disjoint ones apart', () => {
-    const comp = streetComponent(ways, 2).map((w) => w.id).sort();
-    expect(comp).toEqual([1, 2, 3, 5]);
-    expect(streetComponent(ways, 4).map((w) => w.id)).toEqual([4]);
+  it('picks the nearest named road and joins its connected pieces', () => {
+    const s = streetFromTiles(roads, [0.0025, 51.00005])!;
+    expect(s.name).toBe('High St');
+    expect(s.lines).toHaveLength(1);                     // merged into one line, duplicate dropped
+    expect(Math.round(lineLengthM(s.lines[0]))).toBe(Math.round(distM([0, 51], [0.009, 51])));
+    expect(s.highway).toBe('tertiary');                  // the class covering most length
   });
 
-  it('builds a claim candidate from the component', () => {
-    const c = toCandidate(streetComponent(ways, 1), 1);
-    expect(c.name).toBe('High St');
-    expect(c.anchorWay).toBe(1);
-    expect(c.ways).toHaveLength(4);
-    expect(c.ways[0].coords[0]).toEqual([0, 51]);
+  it('ignores footpaths and returns nothing far from roads', () => {
+    expect(streetFromTiles(roads, [0.0007, 51.0001])?.name).toBe('High St');
+    expect(streetFromTiles(roads, [0.03, 51.01])).toBeNull();
   });
 
+  it('can prefer a name (search results)', () => {
+    expect(streetFromTiles(roads, [0.0015, 51.0000], 30, 'Cross Rd')!.name).toBe('Cross Rd');
+  });
+
+  it('maps OpenMapTiles classes to buyable road classes', () => {
+    expect(omtClass('minor')).toBe('residential');
+    expect(omtClass('minor', 'living_street')).toBe('living_street');
+    expect(omtClass('primary')).toBe('primary');
+    expect(omtClass('path', 'pedestrian')).toBe('pedestrian');
+    expect(omtClass('motorway')).toBeNull();
+    expect(omtClass('service')).toBeNull();
+    expect(omtClass('path', 'footway')).toBeNull();
+  });
+});
+
+describe('line helpers', () => {
   it('joins line parts end to end, in either direction', () => {
     const merged = mergeLines([
       [[0, 0], [1, 0]],

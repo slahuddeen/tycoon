@@ -309,43 +309,45 @@ function showParcel(p: Parcel) {
 }
 
 async function claimCandidate(cand: osm.StreetCandidate, seq: number) {
-  gm.setPending(cand.ways.map((w) => w.coords));
+  gm.setPending(cand.lines);
   openPanelHtml(ui.panelLoading(`Found ${cand.name}. Checking the land registry…`));
-  const all = cand.ways.flatMap((w) => w.coords);
-  const mid = all[Math.floor(all.length / 2)];
-  const suburb = await osm.reverseLocality(mid);
+  const all = cand.lines.flat();
+  // Suburb name is a nice-to-have: never wait more than a moment for it.
+  const suburb = await osm.reverseLocality(all[Math.floor(all.length / 2)]);
   if (seq !== state.lookup) return;
-  const p = await api<Parcel>('tycoon_claim', { name: cand.name, suburb, anchor_way: cand.anchorWay, ways: cand.ways });
+  const p = await api<Parcel>('tycoon_claim', { name: cand.name, suburb, highway: cand.highway, lines: cand.lines });
   if (seq !== state.lookup) return;
   gm.setPending(null);
   showParcel(p);
 }
 
-gm.onParcelClick = (id) => { state.lookup++; gm.setPending(null); openParcel(id); };
-
-gm.onEmptyClick = async (at, zoom) => {
-  if (!state.world) return;
-  if (zoom < 14) {
-    toast('Zoom in closer to pick a street.');
-    gm.map.easeTo({ center: at, zoom: Math.min(zoom + 3, 16), duration: 900 });
+async function pickStreet(at: osm.LonLat, preferName?: string, radiusM?: number) {
+  const seq = ++state.lookup;
+  const cand = gm.findStreetAt(at, preferName, radiusM);
+  if (!cand) {
+    closePanel();
+    toast('No buyable street right there. Click directly on a named road (motorways, service roads and footpaths are off-limits).', 'info', 5000);
     return;
   }
-  const seq = ++state.lookup;
-  openPanelHtml(ui.panelLoading('Looking up this street in OpenStreetMap…'));
   try {
-    const cand = await osm.findStreetAt(at);
-    if (seq !== state.lookup) return;
-    if (!cand) {
-      closePanel();
-      toast('No buyable street right there. Click directly on a named road.');
-      return;
-    }
     await claimCandidate(cand, seq);
   } catch (e) {
     if (seq !== state.lookup) return;
     closePanel();
     toast(errorText(e), 'bad', 6000);
   }
+}
+
+gm.onParcelClick = (id) => { state.lookup++; gm.setPending(null); openParcel(id); };
+
+gm.onEmptyClick = (at, zoom) => {
+  if (!state.world) return;
+  if (zoom < 14) {
+    toast('Zoom in closer to pick a street.');
+    gm.map.easeTo({ center: at, zoom: Math.min(zoom + 3, 16), duration: 900 });
+    return;
+  }
+  pickStreet(at);
 };
 
 // ---------------------------------------------------------------- actions
@@ -447,18 +449,12 @@ const actions: Record<string, (el: HTMLElement, ev: Event) => void> = {
   'search-place': async (el) => {
     const pl = state.searchPlaces[Number(el.dataset.i)];
     hideSearch();
-    if (pl.isStreet && pl.wayId) {
+    if (pl.isStreet) {
+      // Fly there, let the map tiles load, then pick the street out of them.
       gm.flyTo([pl.lon, pl.lat], 16.5);
-      const seq = ++state.lookup;
-      openPanelHtml(ui.panelLoading('Looking up this street in OpenStreetMap…'));
-      try {
-        const cand = await osm.findStreetByWay(pl.wayId);
-        if (seq !== state.lookup) return;
-        if (!cand) { closePanel(); toast("That road can't be bought (it's unnamed, or a motorway, service road or path)."); return; }
-        await claimCandidate(cand, seq);
-      } catch (e) {
-        if (seq === state.lookup) { closePanel(); toast(errorText(e), 'bad'); }
-      }
+      openPanelHtml(ui.panelLoading(`Flying to ${pl.name ?? 'the street'}…`));
+      await gm.settled();
+      await pickStreet([pl.lon, pl.lat], pl.name, 120);
     } else {
       gm.flyTo([pl.lon, pl.lat], 15, pl.bbox);
     }

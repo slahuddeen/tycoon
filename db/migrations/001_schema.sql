@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS tycoon.parcels (
   world_id           UUID NOT NULL REFERENCES tycoon.worlds(id),
   name               TEXT NOT NULL,
   suburb             TEXT,
-  osm_way_ids        BIGINT[] NOT NULL,
+  osm_way_ids        BIGINT[],                 -- unused since streets come from map tiles
   geom               JSONB NOT NULL,
   c_lon              DOUBLE PRECISION NOT NULL,
   c_lat              DOUBLE PRECISION NOT NULL,
@@ -93,7 +93,8 @@ CREATE TABLE IF NOT EXISTS tycoon.parcels (
   lease_expires_at   TIMESTAMPTZ,                              -- NULL under freehold
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS parcels_ways_idx  ON tycoon.parcels USING GIN (osm_way_ids);
+ALTER TABLE tycoon.parcels ALTER COLUMN osm_way_ids DROP NOT NULL;   -- for databases made by older versions
+DROP INDEX IF EXISTS tycoon.parcels_ways_idx;
 CREATE INDEX IF NOT EXISTS parcels_box_idx   ON tycoon.parcels
   USING GIST (box(point(min_lon, min_lat), point(max_lon, max_lat)));
 CREATE INDEX IF NOT EXISTS parcels_owner_idx ON tycoon.parcels (world_id, owner_id);

@@ -75,23 +75,27 @@ describe('claiming streets', () => {
     expect(parcel.land_value).toBeGreaterThan(0);
   });
 
-  it('returns the same parcel when any of its ways is clicked again', async () => {
+  it('resolves the same street to the same parcel wherever it is clicked', async () => {
     const p = await newPlayer(db, classic, 'clicker');
-    const st = fakeStreet(-0.2, 51.4, 200);
-    const extra = { id: st.anchor_way + 50000, highway: 'residential', coords: [[-0.19, 51.4], [-0.189, 51.4]] };
-    const a = await api(db, 'tycoon_claim', { ...p, name: 'Twin St', anchor_way: st.anchor_way, ways: [...st.ways, extra] });
-    const b = await api(db, 'tycoon_claim', { ...p, name: 'Twin St', anchor_way: extra.id, ways: [extra] });
+    const a = await claim(db, p, 'Twin St', fakeStreet(-0.2, 51.4, 200));
+    // A different piece of the same street, a little further along.
+    const b = await claim(db, p, 'twin st', fakeStreet(-0.1975, 51.4, 150));
     expect(b.id).toBe(a.id);
+    // Same name in another town is a different street.
+    const far = await claim(db, p, 'Twin St', fakeStreet(-0.1, 51.4, 150));
+    expect(far.id).not.toBe(a.id);
     // The same street in another world is a separate parcel.
     const p2 = await newPlayer(db, landtax, 'clicker2');
-    const c = await api(db, 'tycoon_claim', { ...p2, name: 'Twin St', anchor_way: st.anchor_way, ways: st.ways });
+    const c = await claim(db, p2, 'Twin St', fakeStreet(-0.2, 51.4, 200));
     expect(c.id).not.toBe(a.id);
   });
 
   it('rejects junk geometry and unknown road classes', async () => {
     const p = await newPlayer(db, classic, 'junk');
-    const bad = { anchor_way: 1, ways: [{ id: 1, highway: 'residential', coords: [[500, 500], [501, 501]] }] };
+    const bad = { highway: 'residential', lines: [[[500, 500], [501, 501]]] };
     expect(await apiError(db, 'tycoon_claim', { ...p, name: 'Bad', ...bad })).toContain('invalid_geometry');
+    const empty = { highway: 'residential', lines: [[[1, 1]]] };
+    expect(await apiError(db, 'tycoon_claim', { ...p, name: 'Dot', ...empty })).toContain('invalid_geometry');
     const motorway = fakeStreet(1, 1, 100, 'motorway');
     expect(await apiError(db, 'tycoon_claim', { ...p, name: 'M1', ...motorway })).toContain('street_not_claimable');
     const st = fakeStreet(2, 2, 100);

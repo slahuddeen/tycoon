@@ -1,22 +1,25 @@
-// Street lookup against free OpenStreetMap services (no API keys):
-//  - Overpass API: street geometry by location / name / way id
-//  - Nominatim: place search and reverse geocoding (suburb names)
-// OSM splits one real street into many ways at every junction, so we merge
-// all same-named ways that connect to the one you clicked into one street.
+// Streets and places from free OpenStreetMap-based sources (no API keys):
+//  - Street names and shapes come straight from the vector map tiles the
+//    browser has already downloaded (OpenMapTiles schema), so picking a
+//    street is instant and needs no extra server.
+//  - Nominatim: place search and reverse geocoding (suburb names).
+// A real street is usually split into many pieces (at junctions and tile
+// edges), so we join every same-named piece connected to the one clicked.
 
 export type LonLat = [number, number];
 
-export interface OsmWay {
-  id: number;
-  tags: Record<string, string>;
-  nodes: number[];
-  geometry: { lat: number; lon: number }[];
-}
-
 export interface StreetCandidate {
   name: string;
-  anchorWay: number;
-  ways: { id: number; highway: string; coords: LonLat[] }[];
+  highway: string;          // our road class, e.g. 'residential'
+  lines: LonLat[][];
+}
+
+/** A named road piece as read from the map tiles. */
+export interface TileRoad {
+  name: string;
+  cls: string;              // OpenMapTiles `class`
+  subclass?: string;
+  lines: LonLat[][];
 }
 
 export const CLAIMABLE_CLASSES = [
@@ -24,11 +27,14 @@ export const CLAIMABLE_CLASSES = [
   'unclassified', 'living_street', 'pedestrian',
 ];
 
-const OVERPASS_ENDPOINTS = [
-  'https://overpass-api.de/api/interpreter',
-  'https://overpass.private.coffee/api/interpreter',
-  'https://overpass.kumi.systems/api/interpreter',
-];
+/** OpenMapTiles road class -> our (OSM highway) class, or null if not for sale. */
+export function omtClass(cls: string, subclass?: string): string | null {
+  const c = cls.replace(/_construction$/, '');
+  if (['trunk', 'primary', 'secondary', 'tertiary'].includes(c)) return c;
+  if (c === 'minor') return subclass && CLAIMABLE_CLASSES.includes(subclass) ? subclass : 'residential';
+  if (c === 'path' && subclass === 'pedestrian') return 'pedestrian';
+  return null;
+}
 
 // ----------------------------------------------------------------- geometry
 
@@ -139,122 +145,60 @@ export function alongLines(lines: LonLat[][], d: number): { p: LonLat; bearing: 
 
 // ------------------------------------------------------- street components
 
-const wayCoords = (w: OsmWay): LonLat[] => w.geometry.map((g) => [g.lon, g.lat]);
-
 /**
- * All same-named ways connected to the anchor: sharing a node, or with an
- * endpoint within `gapM` metres of the other way (dual carriageways, small
- * gaps in the data).
+ * The buyable street at a point: the nearest named road piece within
+ * `radiusM`, plus every same-named piece connected to it (ends within
+ * `gapM` of each other). Duplicate pieces from overlapping tiles are dropped.
  */
-export function streetComponent(ways: OsmWay[], anchorId: number, gapM = 30): OsmWay[] {
-  const parent = new Map<number, number>();
-  const find = (x: number): number => {
-    while (parent.get(x) !== x) {
-      parent.set(x, parent.get(parent.get(x)!)!);
-      x = parent.get(x)!;
-    }
-    return x;
-  };
-  const union = (a: number, b: number) => parent.set(find(a), find(b));
-  for (const w of ways) parent.set(w.id, w.id);
-
-  const byNode = new Map<number, number>();
-  for (const w of ways) {
-    for (const n of w.nodes ?? []) {
-      const other = byNode.get(n);
-      if (other !== undefined) union(other, w.id);
-      else byNode.set(n, w.id);
+export function streetFromTiles(roads: TileRoad[], at: LonLat, radiusM = 30, preferName?: string, gapM = 30): StreetCandidate | null {
+  const pieces: { name: string; cls: string; line: LonLat[] }[] = [];
+  const seen = new Set<string>();
+  for (const r of roads) {
+    const cls = omtClass(r.cls, r.subclass);
+    if (!cls || !r.name) continue;
+    for (const line of r.lines) {
+      if (line.length < 2) continue;
+      const key = r.name + '|' + line.map((p) => p[0].toFixed(6) + ',' + p[1].toFixed(6)).join(';');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      pieces.push({ name: r.name, cls, line });
     }
   }
-  const coords = new Map(ways.map((w) => [w.id, wayCoords(w)]));
-  for (const a of ways) {
-    const ca = coords.get(a.id)!;
-    if (!ca.length) continue;
-    const ends = [ca[0], ca[ca.length - 1]];
-    for (const b of ways) {
-      if (a.id === b.id || find(a.id) === find(b.id)) continue;
-      const cb = coords.get(b.id)!;
-      if (ends.some((e) => pointLineDistM(e, cb) <= gapM)) union(a.id, b.id);
+  let anchor = -1, best = Infinity;
+  pieces.forEach((pc, i) => {
+    let d = pointLineDistM(at, pc.line);
+    if (preferName && pc.name.toLowerCase() !== preferName.toLowerCase()) d += radiusM;
+    if (d < best) { best = d; anchor = i; }
+  });
+  if (anchor < 0 || best > radiusM) return null;
+  const name = pieces[anchor].name;
+  const same = pieces.filter((p) => p.name === name);
+  const start = same.indexOf(pieces[anchor]);
+  const inComp = new Set([start]);
+  const queue = [start];
+  while (queue.length) {
+    const a = same[queue.pop()!].line;
+    for (let j = 0; j < same.length; j++) {
+      if (inComp.has(j)) continue;
+      const b = same[j].line;
+      const touch = [a[0], a[a.length - 1]].some((e) => pointLineDistM(e, b) <= gapM) ||
+        [b[0], b[b.length - 1]].some((e) => pointLineDistM(e, a) <= gapM);
+      if (touch) { inComp.add(j); queue.push(j); }
     }
   }
-  if (!parent.has(anchorId)) return [];
-  const root = find(anchorId);
-  return ways.filter((w) => find(w.id) === root);
-}
-
-export function toCandidate(component: OsmWay[], anchorId: number): StreetCandidate {
-  const anchor = component.find((w) => w.id === anchorId) ?? component[0];
-  return {
-    name: anchor.tags.name,
-    anchorWay: anchor.id,
-    ways: component
-      .filter((w) => w.geometry?.length >= 2)
-      .map((w) => ({ id: w.id, highway: w.tags.highway, coords: wayCoords(w) })),
-  };
+  const comp = [...inComp].map((i) => same[i]);
+  // Road class = the class covering the most length.
+  const byClass = new Map<string, number>();
+  for (const p of comp) byClass.set(p.cls, (byClass.get(p.cls) ?? 0) + lineLengthM(p.line));
+  const highway = [...byClass.entries()].sort((x, y) => y[1] - x[1])[0][0];
+  return { name, highway, lines: mergeLines(comp.map((p) => p.line)) };
 }
 
 // --------------------------------------------------------------- network
 
-async function overpass(query: string): Promise<OsmWay[]> {
-  let lastErr: unknown = null;
-  for (const url of OVERPASS_ENDPOINTS) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 25000);
-    try {
-      const res = await fetch(url, {
-        method: 'POST',
-        body: 'data=' + encodeURIComponent(query),
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        signal: ctrl.signal,
-      });
-      if (!res.ok) throw new Error(`Overpass ${res.status}`);
-      const json = await res.json();
-      return (json.elements ?? []).filter((e: any) => e.type === 'way');
-    } catch (e) {
-      lastErr = e;
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-  throw new Error('street_lookup_failed: ' + String((lastErr as Error)?.message ?? lastErr));
-}
-
-const classRegex = () => `^(${CLAIMABLE_CLASSES.join('|')})$`;
-const quote = (s: string) => '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
-
-async function sameNamedAround(name: string, at: LonLat, anchorId: number): Promise<StreetCandidate | null> {
-  const ways = await overpass(
-    `[out:json][timeout:25];way(around:3000,${at[1]},${at[0]})[highway~"${classRegex()}"]["name"=${quote(name)}];out geom;`,
-  );
-  const comp = streetComponent(ways, anchorId);
-  return comp.length ? toCandidate(comp, anchorId) : null;
-}
-
-/** The named, buyable street nearest to a clicked point (or null). */
-export async function findStreetAt(at: LonLat, radiusM = 40): Promise<StreetCandidate | null> {
-  const near = await overpass(
-    `[out:json][timeout:20];way(around:${radiusM},${at[1]},${at[0]})[highway~"${classRegex()}"][name];out geom;`,
-  );
-  if (!near.length) return null;
-  let best = near[0], bestD = Infinity;
-  for (const w of near) {
-    const d = pointLineDistM(at, wayCoords(w));
-    if (d < bestD) { bestD = d; best = w; }
-  }
-  return sameNamedAround(best.tags.name, at, best.id);
-}
-
-/** Resolve a street from an OSM way id (e.g. from a search result). */
-export async function findStreetByWay(wayId: number): Promise<StreetCandidate | null> {
-  const ways = await overpass(`[out:json][timeout:20];way(${wayId});out geom;`);
-  const w = ways[0];
-  if (!w || !w.tags?.name || !CLAIMABLE_CLASSES.includes(w.tags.highway)) return null;
-  const mid = w.geometry[Math.floor(w.geometry.length / 2)];
-  return sameNamedAround(w.tags.name, [mid.lon, mid.lat], w.id);
-}
-
 export interface PlaceResult {
   label: string;
+  name?: string;
   lon: number;
   lat: number;
   bbox?: [number, number, number, number];
@@ -269,6 +213,7 @@ export async function searchPlaces(q: string): Promise<PlaceResult[]> {
   const rows: any[] = await res.json();
   return rows.map((r) => ({
     label: r.display_name,
+    name: r.name || undefined,
     lon: Number(r.lon),
     lat: Number(r.lat),
     bbox: r.boundingbox
@@ -283,7 +228,7 @@ export async function searchPlaces(q: string): Promise<PlaceResult[]> {
 export async function reverseLocality(at: LonLat): Promise<string | null> {
   try {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 6000);
+    const timer = setTimeout(() => ctrl.abort(), 2500);
     const res = await fetch(
       `https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=14&lat=${at[1]}&lon=${at[0]}`,
       { signal: ctrl.signal, headers: { Accept: 'application/json' } },

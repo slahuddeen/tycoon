@@ -79,7 +79,7 @@ CREATE TABLE IF NOT EXISTS tycoon.parcels (
   world_id           UUID NOT NULL REFERENCES tycoon.worlds(id),
   name               TEXT NOT NULL,
   suburb             TEXT,
-  osm_way_ids        BIGINT[] NOT NULL,
+  osm_way_ids        BIGINT[],                 -- unused since streets come from map tiles
   geom               JSONB NOT NULL,
   c_lon              DOUBLE PRECISION NOT NULL,
   c_lat              DOUBLE PRECISION NOT NULL,
@@ -98,7 +98,8 @@ CREATE TABLE IF NOT EXISTS tycoon.parcels (
   lease_expires_at   TIMESTAMPTZ,                              -- NULL under freehold
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS parcels_ways_idx  ON tycoon.parcels USING GIN (osm_way_ids);
+ALTER TABLE tycoon.parcels ALTER COLUMN osm_way_ids DROP NOT NULL;   -- for databases made by older versions
+DROP INDEX IF EXISTS tycoon.parcels_ways_idx;
 CREATE INDEX IF NOT EXISTS parcels_box_idx   ON tycoon.parcels
   USING GIST (box(point(min_lon, min_lat), point(max_lon, max_lat)));
 CREATE INDEX IF NOT EXISTS parcels_owner_idx ON tycoon.parcels (world_id, owner_id);
@@ -724,24 +725,25 @@ BEGIN
 END $$;
 
 -- ---------------------------------------------------------------------
--- Street claiming. The browser looks a street up in OpenStreetMap and
--- submits its ways; the server validates them, computes length, class,
--- slots and land value itself, and creates the parcel. A way can belong
--- to only one parcel per world, so the same street always resolves to the
--- same parcel no matter where on it you click.
--- p_ways: [{"id": 123, "highway": "residential", "coords": [[lon,lat], ...]}, ...]
+-- Street claiming. The browser reads a street's name and shape from the
+-- map tiles and submits it; the server validates it, computes length,
+-- slots and land value itself, and creates the parcel. A street is
+-- identified by its name plus where it is: the same name within ~150 m of
+-- an existing parcel resolves to that parcel, so clicking anywhere along a
+-- street always gives the same one.
+-- p_lines: [[[lon,lat], ...], ...]
 -- ---------------------------------------------------------------------
+DROP FUNCTION IF EXISTS tycoon.claim_parcel(UUID, TEXT, TEXT, BIGINT, JSONB);
 CREATE OR REPLACE FUNCTION tycoon.claim_parcel(p_world UUID, p_name TEXT, p_suburb TEXT,
-                                               p_anchor BIGINT, p_ways JSONB)
+                                               p_highway TEXT, p_lines JSONB)
 RETURNS BIGINT LANGUAGE plpgsql AS $$
 DECLARE
   cfg JSONB := tycoon.world_config(p_world);
   v_id BIGINT;
-  v_ids BIGINT[];
   v_geom JSONB;
   v_len DOUBLE PRECISION;
-  v_class TEXT;
   c RECORD;
+  v_pad DOUBLE PRECISION;
   v_slots INT;
   v_land NUMERIC;
 BEGIN
@@ -749,70 +751,57 @@ BEGIN
   p_name := btrim(p_name);
   IF p_name IS NULL OR p_name = '' OR length(p_name) > 200 THEN RAISE EXCEPTION 'invalid_name'; END IF;
   IF p_suburb IS NOT NULL AND length(p_suburb) > 200 THEN p_suburb := left(p_suburb, 200); END IF;
-  IF jsonb_typeof(p_ways) <> 'array' OR jsonb_array_length(p_ways) = 0
-     OR jsonb_array_length(p_ways) > 500 THEN
-    RAISE EXCEPTION 'invalid_geometry';
-  END IF;
-
-  -- Serialise claims within a world so a way is never claimed twice.
-  PERFORM pg_advisory_xact_lock(hashtext('tycoon-claim'), hashtext(p_world::TEXT));
-
-  SELECT id INTO v_id FROM tycoon.parcels
-   WHERE world_id = p_world AND osm_way_ids @> ARRAY[p_anchor] LIMIT 1;
-  IF FOUND THEN RETURN v_id; END IF;
-
-  CREATE TEMP TABLE IF NOT EXISTS _claim_pts (way_id BIGINT, hw TEXT, ord INT, lon FLOAT8, lat FLOAT8)
-    ON COMMIT DROP;
-  TRUNCATE _claim_pts;
-  INSERT INTO _claim_pts
-  SELECT (w ->> 'id')::BIGINT, w ->> 'highway', pt.ord::INT, (pt.v ->> 0)::FLOAT8, (pt.v ->> 1)::FLOAT8
-    FROM jsonb_array_elements(p_ways) w
-    CROSS JOIN LATERAL jsonb_array_elements(w -> 'coords') WITH ORDINALITY AS pt(v, ord)
-   WHERE jsonb_typeof(w -> 'coords') = 'array'
-     AND (cfg -> 'valuation' -> 'class_weights') ? (w ->> 'highway')
-     AND NOT EXISTS (SELECT 1 FROM tycoon.parcels q
-                      WHERE q.world_id = p_world AND q.osm_way_ids @> ARRAY[(w ->> 'id')::BIGINT]);
-
-  IF EXISTS (SELECT 1 FROM _claim_pts WHERE lon IS NULL OR lat IS NULL
-               OR lon NOT BETWEEN -180 AND 180 OR lat NOT BETWEEN -85 AND 85) THEN
-    RAISE EXCEPTION 'invalid_geometry';
-  END IF;
-  IF NOT EXISTS (SELECT 1 FROM _claim_pts WHERE way_id = p_anchor) THEN
+  IF p_highway IS NULL OR NOT ((cfg -> 'valuation' -> 'class_weights') ? p_highway) THEN
     RAISE EXCEPTION 'street_not_claimable';
   END IF;
-  IF (SELECT count(*) FROM _claim_pts) > 20000 THEN RAISE EXCEPTION 'invalid_geometry'; END IF;
-
-  -- Per-way length, then totals.
-  CREATE TEMP TABLE IF NOT EXISTS _claim_ways (way_id BIGINT, hw TEXT, len FLOAT8, pts INT)
-    ON COMMIT DROP;
-  TRUNCATE _claim_ways;
-  INSERT INTO _claim_ways
-  SELECT way_id, min(hw), COALESCE(SUM(seg), 0), count(*)
-    FROM (SELECT way_id, hw,
-                 tycoon.geo_dist_m(lag(lat) OVER w, lag(lon) OVER w, lat, lon) AS seg
-            FROM _claim_pts WINDOW w AS (PARTITION BY way_id ORDER BY ord)) s
-   GROUP BY way_id;
-  DELETE FROM _claim_ways WHERE pts < 2;
-  IF NOT EXISTS (SELECT 1 FROM _claim_ways WHERE way_id = p_anchor) THEN
+  IF jsonb_typeof(p_lines) IS DISTINCT FROM 'array' OR jsonb_array_length(p_lines) = 0
+     OR jsonb_array_length(p_lines) > 500 THEN
     RAISE EXCEPTION 'invalid_geometry';
   END IF;
 
-  SELECT SUM(len), array_agg(way_id ORDER BY way_id) INTO v_len, v_ids FROM _claim_ways;
+  CREATE TEMP TABLE IF NOT EXISTS _claim_pts (line INT, ord INT, lon FLOAT8, lat FLOAT8) ON COMMIT DROP;
+  TRUNCATE _claim_pts;
+  INSERT INTO _claim_pts
+  SELECT l.idx::INT, pt.ord::INT, (pt.v ->> 0)::FLOAT8, (pt.v ->> 1)::FLOAT8
+    FROM jsonb_array_elements(p_lines) WITH ORDINALITY AS l(v, idx)
+    CROSS JOIN LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(l.v) = 'array' THEN l.v ELSE '[]'::JSONB END)
+         WITH ORDINALITY AS pt(v, ord);
+
+  IF (SELECT count(*) FROM _claim_pts) > 20000
+     OR EXISTS (SELECT 1 FROM _claim_pts WHERE lon IS NULL OR lat IS NULL
+                  OR lon NOT BETWEEN -180 AND 180 OR lat NOT BETWEEN -85 AND 85) THEN
+    RAISE EXCEPTION 'invalid_geometry';
+  END IF;
+  -- Drop parts with fewer than two points.
+  DELETE FROM _claim_pts WHERE line IN (SELECT line FROM _claim_pts GROUP BY line HAVING count(*) < 2);
+
+  SELECT SUM(seg) INTO v_len FROM (
+    SELECT tycoon.geo_dist_m(lag(lat) OVER w, lag(lon) OVER w, lat, lon) AS seg
+      FROM _claim_pts WINDOW w AS (PARTITION BY line ORDER BY ord)) s;
   IF v_len IS NULL OR v_len <= 0 THEN RAISE EXCEPTION 'invalid_geometry'; END IF;
   IF v_len > 50000 THEN RAISE EXCEPTION 'street_too_long'; END IF;
 
-  -- Class = the highway type covering the most length.
-  SELECT hw INTO v_class FROM _claim_ways GROUP BY hw ORDER BY SUM(len) DESC, hw LIMIT 1;
+  SELECT avg(lon) AS c_lon, avg(lat) AS c_lat, min(lon) AS min_lon, min(lat) AS min_lat,
+         max(lon) AS max_lon, max(lat) AS max_lat
+    INTO c FROM _claim_pts;
 
-  SELECT jsonb_agg(line ORDER BY way_id) INTO v_geom FROM (
-    SELECT p.way_id, jsonb_agg(jsonb_build_array(p.lon, p.lat) ORDER BY p.ord) AS line
-      FROM _claim_pts p JOIN _claim_ways w ON w.way_id = p.way_id
-     GROUP BY p.way_id) l;
+  -- Serialise claims within a world so one street is never created twice.
+  PERFORM pg_advisory_xact_lock(hashtext('tycoon-claim'), hashtext(p_world::TEXT));
 
-  SELECT avg(p.lon) AS c_lon, avg(p.lat) AS c_lat, min(p.lon) AS min_lon, min(p.lat) AS min_lat,
-         max(p.lon) AS max_lon, max(p.lat) AS max_lat
-    INTO c
-    FROM _claim_pts p JOIN _claim_ways w ON w.way_id = p.way_id;
+  v_pad := tycoon.metres_to_lat_deg(150);
+  SELECT q.id INTO v_id FROM tycoon.parcels q
+   WHERE q.world_id = p_world
+     AND lower(q.name) = lower(p_name)
+     AND box(point(q.min_lon, q.min_lat), point(q.max_lon, q.max_lat))
+         && box(point(c.min_lon - v_pad / cos(radians(c.c_lat)), c.min_lat - v_pad),
+                point(c.max_lon + v_pad / cos(radians(c.c_lat)), c.max_lat + v_pad))
+   ORDER BY tycoon.geo_dist_m(q.c_lat, q.c_lon, c.c_lat, c.c_lon)
+   LIMIT 1;
+  IF FOUND THEN RETURN v_id; END IF;
+
+  SELECT jsonb_agg(line ORDER BY l) INTO v_geom FROM (
+    SELECT line AS l, jsonb_agg(jsonb_build_array(lon, lat) ORDER BY ord) AS line
+      FROM _claim_pts GROUP BY line) x;
 
   v_slots := LEAST((cfg -> 'slots' ->> 'max')::INT,
                    GREATEST((cfg -> 'slots' ->> 'min')::INT,
@@ -821,8 +810,8 @@ BEGIN
   INSERT INTO tycoon.parcels (world_id, name, suburb, osm_way_ids, geom, c_lon, c_lat,
                               min_lon, min_lat, max_lon, max_lat, length_m, highway_class,
                               slots_total, density_weight, land_value)
-  VALUES (p_world, p_name, NULLIF(btrim(p_suburb), ''), v_ids, v_geom, c.c_lon, c.c_lat,
-          c.min_lon, c.min_lat, c.max_lon, c.max_lat, v_len, v_class, v_slots,
+  VALUES (p_world, p_name, NULLIF(btrim(p_suburb), ''), NULL, v_geom, c.c_lon, c.c_lat,
+          c.min_lon, c.min_lat, c.max_lon, c.max_lat, v_len, p_highway, v_slots,
           tycoon.density_for(p_world, cfg, c.c_lat, c.c_lon, NULL), 0)
   RETURNING id INTO v_id;
 
@@ -1169,7 +1158,7 @@ DECLARE v_id BIGINT;
 BEGIN
   PERFORM tycoon.auth_account(p);
   v_id := tycoon.claim_parcel((p ->> 'world_id')::UUID, p ->> 'name', p ->> 'suburb',
-                              (p ->> 'anchor_way')::BIGINT, p -> 'ways');
+                              p ->> 'highway', p -> 'lines');
   RETURN tycoon.parcel_json(v_id, true);
 END $$;
 

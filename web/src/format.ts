@@ -109,7 +109,6 @@ const ERRORS: Record<string, string> = {
   not_joined: "You haven't joined this world yet.",
   street_not_claimable: "That road can't be bought (motorways, service roads and paths are off-limits).",
   street_too_long: 'That road is too long to buy as one street.',
-  street_lookup_failed: "Couldn't reach OpenStreetMap to look up that street. Try again in a moment.",
   invalid_geometry: "That street's map data looks broken, so it can't be bought.",
   amount_exceeds_loan: "That's more than you owe.",
   invalid_amount: 'Enter an amount greater than zero.',
