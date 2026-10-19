@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Tycoon: buy the streets of the world</title>
+    <meta name="description" content="A multiplayer property game played on the real streets of the world. Buy streets, build in 3D, out-earn your friends." />
+    <link rel="icon" href="./favicon.svg" type="image/svg+xml" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <!-- Server settings. Edit config.js to point the game at your Supabase project. -->
+    <script src="./config.js"></script>
+  </head>
+  <body class="pregame">
+    <div id="map"></div>
+
+    <header id="hud" hidden></header>
+
+    <div id="search" hidden>
+      <form role="search">
+        <span aria-hidden="true">🔎</span>
+        <input type="search" placeholder="Search any street or place on Earth…" aria-label="Search streets and places" autocomplete="off" />
+      </form>
+      <div id="search-results" hidden></div>
+    </div>
+
+    <aside id="panel" hidden></aside>
+
+    <section id="feed" hidden>
+      <h4>Live</h4>
+      <ul id="feed-list"></ul>
+    </section>
+
+    <div id="toasts" aria-live="polite"></div>
+    <div id="overlay"></div>
+    <div id="modal" hidden></div>
+
+    <script type="module" src="./src/main.ts"></script>
+  </body>
+</html>

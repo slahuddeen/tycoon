@@ -1,0 +1,74 @@
+name: Test and deploy
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: tycoon_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Database and unit tests (real Postgres)
+        run: npm test
+        env:
+          TYCOON_PG_URL: postgres://postgres:postgres@localhost:5432/tycoon_test
+      - name: Bundled SQL is up to date
+        run: git diff --exit-code supabase/setup.sql
+      - run: npm run build
+
+  deploy:
+    # Publishes the site from the repository's default branch.
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Use server settings from repository variables (optional)
+        if: vars.TYCOON_SUPABASE_URL != '' && vars.TYCOON_SUPABASE_KEY != ''
+        run: |
+          cat > dist/config.js <<JS
+          window.TYCOON_CONFIG = {
+            supabaseUrl: '${{ vars.TYCOON_SUPABASE_URL }}',
+            supabaseKey: '${{ vars.TYCOON_SUPABASE_KEY }}',
+          };
+          JS
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - id: deployment
+        uses: actions/deploy-pages@v4
