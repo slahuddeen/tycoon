@@ -27,6 +27,18 @@ Once GitHub Pages is switched on (below), the game lives at
 
 Motorways, service roads and footpaths can't be bought.
 
+## Single-player, anywhere in the world
+
+With no server configured, the live site is a single-player sandbox:
+
+- Every street on Earth is playable (London, Tokyo, a village lane), as long as it's a named road in OpenStreetMap.
+- The whole game database runs inside your browser and saves there. Clearing site data, or using another browser or device, starts you fresh.
+- The ⏩ **Tick now** button skips ahead, so you don't have to wait an hour for income.
+- Both worlds (*Classic* and *Land Tax*) and every feature work the same as online. You just won't see other players.
+
+Once a Supabase server is added (below), the site switches to shared multiplayer for everyone.
+Any player can still choose the sandbox from **Server settings** on the login screen.
+
 ## Setting it up
 
 ### 1. Turn on GitHub Pages (one click)
